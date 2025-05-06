@@ -1,0 +1,3253 @@
+---
+title: "Data Analysis"
+author: "Nelma Péclard"
+date: "2025-02-18"
+output: html_document
+---
+
+```{r setup, include = TRUE, output = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#empty environment before starting the script
+rm(list=ls()) 
+
+# Load necessary libraries
+library(googlesheets4)
+library(googledrive)
+library(RColorBrewer)    # plotting (color palettes)
+library(paletteer)       # plotting (color palettes)
+library(gridExtra)       # plotting (arrange multiple plots together)
+library(patchwork)       # plotting (combine multiple plots)
+library(corrplot)        # plotting (correlation plots)
+library(ggpubr)          # plotting (publication-ready plots)
+library(lubridate)       # date and time data
+library(hms)             # time data
+library(Hmisc)           # used for correlation analysis
+#library(MASS)
+library(lme4)            # GLMM (esp Poisson)
+library(glmmTMB)         # GLMM (esp negbin)
+library(DHARMa)          # checking GLMM assumptions
+library(easystats)       # GLMM assumptions and model performance
+library(broom.mixed)     # tidying mixed models results
+library(ggeffects)       # plot model predictions
+library(emmeans)         # EMMs (used for post hoc tests)
+library(multcompView)    # plot results of post hoc text
+library(sjPlot)          # effect sizes plot
+library(car)             # anova type 2 & 3 tables
+library(tidyverse)       # data wrangling
+```
+
+## Thesis Data Analysis
+
+In this document I go through each of my research questions and perform all statistical analyses necessary to answer them.
+
+Before going into each research question, I load and prepare all the necessary data.
+
+### 0. Data loading and general data preparation
+
+#### 0.1 Loading tables from Google Drive
+
+The three main data tables (environmental data and information on experiment start time/location/etc., species identification data, experiment data with amount of ants observed at different time points) are loaded and the variables are reformatted as needed.
+
+When I was working on the data analysis, I loaded the data directly from Google Sheets files in my personal Google Drive. To read the data available in the GitHub repository, the lines for loading files from google drive need to be commented out, and the lines for loading the data from the repository need to be used instead.
+
+```{r 0.1.1 load data}
+# loading the google sheet containing the experiment data from google drive directly
+exp_data <- drive_get("experiment_data_all_years") %>%
+  read_sheet(, sheet = 2)
+
+# load the .csv file from the online repository
+# exp_data <- read.csv("../data/tables_for_data_analysis/experiment_data_all_years.csv", na = c(""))
+# exp_data$count_time <- as.character(exp_data$count_time)  # turning the count_time column into strings
+
+# loading the google sheet containing the environmental data from google drive directly
+env_data <- drive_get("full_env_data_all_years") %>%
+  read_sheet(, sheet = 2)
+
+# load the .csv file from the online repository
+#env_data <- read.csv("../data/tables_for_data_analysis/full_env_data_all_years.csv", na = c(""))
+
+env_data$date_time <- dmy_hm(paste0(env_data$date, sep = " ", env_data$start_time))
+env_data$date <- dmy(env_data$date)  # turning the date column into a date object
+env_data$start_time[!is.na(env_data$start_time)] <- paste0(env_data$start_time[!is.na(env_data$start_time)], ":00") 
+env_data$start_time <- as_hms(env_data$start_time)  # turning the start_time column into a hh:mm:ss time object
+env_data$end_time[!is.na(env_data$end_time)] <- paste0(env_data$end_time[!is.na(env_data$end_time)], ":00") 
+env_data$end_time <- as_hms(env_data$end_time)  # turning the end_time column into a hh:mm:ss time object
+
+# loading the google sheet containing the identified species data from google drive directly
+species_data <- drive_get("species_data_all_years") %>%
+  read_sheet(, sheet = 2)
+
+# load the .csv file from the online repository
+#species_data <- read.csv("../data/tables_for_data_analysis/species_data_all_years.csv", na = c(""))
+```
+
+#### 0.2 Preparation of ant counts data
+
+##### 0.2.1 Ant totals
+
+For most of the analyses, I need the total number of ants found on all baits of one experiment at the end of the experiment.
+
+```{r 0.2.1.1 first calculation of total number of ants}
+# first calculation of the total number of ants counted after 120 min, after freezing, and in the lab before identification
+tmp_exp_totals <- exp_data %>%
+  filter(count_time %in% c("120", "Frozen", "Lab")) %>%  # Keep only relevant time points
+  group_by(sample_ID, count_time) %>%  # Group by experiment and time point
+  summarise(
+    total_ants = if_else(all(is.na(individuals)), NA, sum(individuals, na.rm = TRUE)),  
+    .groups = "drop") %>%  
+  pivot_wider(names_from = count_time, values_from = total_ants, names_prefix = "total_")  # Convert to wide format
+
+# comparing the number of experiments where all values were NA between 120 min, after freezing, in the lab
+length(tmp_exp_totals$total_120[is.na(tmp_exp_totals$total_120)]) 
+length(tmp_exp_totals$total_Frozen[is.na(tmp_exp_totals$total_Frozen)])
+length(tmp_exp_totals$total_Lab[is.na(tmp_exp_totals$total_Lab)])
+```
+
+There are a lot more rows with missing values in the total ants counted after freezing or in the lab than at 120 minutes. This is very likely in part due to participants not reporting 0s after freezing on experiments where no ant was collected, and not sending back the empty ethanol vials. 
+
+I filtered the data table on Google Sheets and found that the number of experiments which have 0 ants at 120 minutes for all sugar concentrations but all missing values for lab counting is 13. Since participants wrote that there were 0 ants on all concentrations of the experiment at 120 minutes (the end of the experiment), I can consider that there were no ants to be sent back and counted in the lab. In those specific cases, I replace the NAs recorded in the lab by 0s. I do not modify experiments where one or more of the concentration had anything other than 0 (whether NA or positive value) ants at 120 minutes.
+
+```{r 0.2.1.2 modifying lab missing values}
+# extract experiments where all concentrations had 0 ants at 120 and lab has all NAs
+
+# for each experiment, check that at count_time "120" the individuals count is 0 for every concentration.
+tmp_exp_zero_120 <- exp_data %>%
+  filter(count_time == "120") %>%  # select only rows at 120 minutes
+  group_by(sample_ID) %>%
+  summarise(
+    n_obs = n(),                  # Count number of rows (should be 5 i.e. all 5 baits had no ants)
+    all_zero = all(individuals == 0)     # Will be NA if any value is NA
+    ) %>%
+  filter(n_obs == 5, all_zero == TRUE) %>%  # Keep only experiments with 5 observations all equal to 0
+  pull(sample_ID) 
+
+# for each experiment, filter those with NA at each concentration at count_time "lab"
+tmp_exp_na_lab <- exp_data %>%
+  filter(count_time == "Lab") %>%
+  group_by(sample_ID) %>%
+  summarise(all_na = all(is.na(individuals))) %>%  # find all NA totals counted in the lab
+  filter(all_na) %>%  # only keep NA totals
+  pull(sample_ID)
+
+# find experiments where both all 120 counts = 0 and all lab counts = NA
+tmp_experiments_0_na <- intersect(tmp_exp_zero_120, tmp_exp_na_lab)
+
+# create new data frame with modified values for lab counts
+corr_exp_data <- exp_data %>%
+  mutate(individuals = if_else(
+    count_time == "Lab" & sample_ID %in% tmp_experiments_0_na & is.na(individuals),
+    0,  # replace NA with 0 for lab samples from exp in the list above with all NA values
+    individuals))  # otherwise, keep the original value
+```
+
+I can now recalculate the total number of ants per experiment.
+
+```{r 0.2.1.3 recalculating experiment totals}
+exp_totals <- corr_exp_data %>%
+  filter(count_time %in% c("120", "Frozen", "Lab")) %>%  # Keep only relevant time points
+  group_by(sample_ID, count_time) %>%  # Group by experiment and time point
+  summarise(
+    total_ants = if_else(all(is.na(individuals)), NA, sum(individuals, na.rm = TRUE)),  # if all values are NA, keep NA, if at least 1 value is real, sum
+    .groups = "drop") %>%  
+  pivot_wider(names_from = count_time, values_from = total_ants, names_prefix = "total_")  # Convert to wide format
+
+head(exp_totals)
+```
+
+I can also obtain the total of ants from each experiment from the species data, which should correspond to the lab count totals. The species data only has rows for experiments which had ants, so the experiments where 0 ants were found need to be added.
+
+The totals per concentration for each experiment can also be extracted from the species data and the lab count data (to add the values for the experiments with 0 ants).
+
+```{r 0.2.1.4 totals from species data}
+# remove non-ants from the species data
+corr_species_data <- species_data[species_data$family != "non-ant",]
+
+## totals per experiment
+
+# extract the total number of ants of all species per experiment
+tmp_sp_totals <- corr_species_data %>%
+  group_by(sample_ID) %>%  # Group by experiment
+  summarise(total_ants_sp = sum(individuals),
+    .groups = "drop")
+
+nrow(tmp_sp_totals); nrow(env_data) # sp_totals has less rows because many exp had no ants
+
+# intermediary check that the total of ants is the same as in the initial data frame
+sum(tmp_sp_totals$total_ants_sp, na.rm = T) == sum(corr_species_data$individuals, na.rm = T)
+
+# Create a complete data frame with all sample_IDs
+sp_totals <- expand.grid(sample_ID = unique(env_data$sample_ID))  # take sample ID column from env_data to have the full 239 experiments
+
+# Merge complete data frame with ant totals
+sp_totals <- left_join(sp_totals, tmp_sp_totals, by = c("sample_ID")) 
+
+# from exp_totals, filter experiments where the lab total count was 0 or NA
+tmp_exp_totals_0_na <- exp_totals %>%
+  filter(total_Lab == 0 | is.na(total_Lab)) %>%
+  dplyr::select(sample_ID, total_Lab) 
+
+# update ant counts in species totals with exp where lab count is 0 or NA
+sp_totals <- sp_totals %>%
+  left_join(tmp_exp_totals_0_na, by = c("sample_ID")) %>%
+  mutate(total_ants_sp = ifelse(!is.na(total_Lab) & total_Lab == 0 & is.na(total_ants_sp), 0, total_ants_sp)) %>%
+  dplyr::select(sample_ID, total_ants_sp)
+
+# check sum of individuals is the same as in corr_species_data & we have the same sample IDs as in env_data
+sum(sp_totals$total_ants_sp, na.rm = T) == sum(corr_species_data$individuals, na.rm = T) 
+all(unique(sp_totals$sample_ID) == env_data$sample_ID)
+
+# compare number of rows with total = NA or total = 0
+nrow(sp_totals[is.na(sp_totals$total_ants_sp),]); nrow(exp_totals[is.na(exp_totals$total_Lab),])
+nrow(na.omit(sp_totals[sp_totals$total_ants_sp == 0,])) == nrow(exp_totals[exp_totals$total_Lab == 0 & !is.na(exp_totals$total_Lab),])
+
+# 1 more row with NA in sp_totals than exp totals: check if samples not in the species dataset have ants
+na.omit(exp_totals[exp_totals$sample_ID %in% setdiff(env_data$sample_ID, tmp_sp_totals$sample_ID) & exp_totals$total_Lab > 0, c(1,4)]) 
+# exp 22-11009 has ants counted in the lab which were not identified and will show as NA in sp_totals
+
+
+## totals per bait
+
+# extract the total number of ants of all species per experiment and bait
+tmp_sp_totals_bait <- corr_species_data %>%
+  group_by(sample_ID, concentration) %>%  # Group by experiment ant concentration
+  summarise(total_ants_sp_bait = sum(individuals),
+    .groups = "drop")
+
+# intermediary check that the total of ants is the same as in the initial data frame
+sum(tmp_sp_totals_bait$total_ants_sp_bait, na.rm = T) == sum(corr_species_data$individuals, na.rm = T)
+
+# Create a complete data frame with all combinations of sample ID and concentration
+sp_totals_bait <- expand.grid(
+  sample_ID = unique(env_data$sample_ID), # take sample ID column from env_data to have the full 239 experiments
+  concentration = unique(corr_exp_data$concentration))  # all concentrations from 0 to 40
+ 
+# Merge complete data frame with ant bait totals
+sp_totals_bait <- left_join(sp_totals_bait, tmp_sp_totals_bait, by = c("sample_ID", "concentration")) %>%
+  arrange(sample_ID, concentration)
+
+# from corr_exp_data, filter experiments where the lab total count was 0 or NA
+tmp_exp_0_na <- corr_exp_data %>%
+  filter(count_time == "Lab" & (individuals == 0 | is.na(individuals))) %>%
+  dplyr::select(sample_ID, concentration, individuals) %>%
+  rename(lab_count = individuals)
+
+# update ant counts in bait totals with exp where lab count is 0 or NA
+sp_totals_bait <- sp_totals_bait %>%
+  left_join(tmp_exp_0_na, by = c("sample_ID", "concentration")) %>%
+  mutate(total_ants_sp_bait = ifelse(!is.na(lab_count) & lab_count == 0 & is.na(total_ants_sp_bait), 0, total_ants_sp_bait)) %>%
+  dplyr::select(sample_ID, concentration, total_ants_sp_bait) %>%
+  arrange(sample_ID, concentration)
+
+# check sum of individuals is the same as in corr_species_data & we have the same sample IDs as in env_data
+sum(sp_totals_bait$total_ants_sp_bait, na.rm = T) == sum(corr_species_data$individuals, na.rm = T) 
+all(unique(sp_totals_bait$sample_ID) == env_data$sample_ID)
+
+# compare number of rows with total = NA or total = 0
+nrow(sp_totals_bait[is.na(sp_totals_bait$total_ants_sp_bait),]); nrow(tmp_exp_0_na[is.na(tmp_exp_0_na$lab_count),])
+nrow(na.omit(sp_totals_bait[sp_totals_bait$total_ants_sp_bait == 0,])) == nrow(tmp_exp_0_na[tmp_exp_0_na$lab_count == 0 & !is.na(tmp_exp_0_na$lab_count),])
+
+# 1 more row with NA in sp_totals_bait than exp totals: check if samples not in the species dataset have ants
+na.omit(corr_exp_data[corr_exp_data$sample_ID %in%  setdiff(env_data$sample_ID, tmp_sp_totals_bait$sample_ID) & corr_exp_data$count_time == "Lab" & corr_exp_data$individuals > 0, c(1:2,4)]) 
+# also exp 22-11009 has ants counted in the lab which were not identified and will show as NA in sp_totals
+```
+
+Experiment 22-11009 had 2 ants counted in the lab but no ants in the species data, meaning the species was not identified because the sample was not found. As it stands, this row is reported as NA in the species totals.
+
+I compare the species data with the experiment data to see whether the total number of ants for each experiment matches.
+
+```{r 0.2.1.5 compare ant totals}
+## comparing ant totals per experiment
+
+# add the total_lab column calculated previously
+tmp_totals_comparison <- cbind(sp_totals, exp_totals$total_Lab)
+
+# extract experiments where the total from the lab counting and the total from the species data does not match
+exp_problem_totals <- tmp_totals_comparison[tmp_totals_comparison[,2] != tmp_totals_comparison[,3],]
+exp_problem_totals <- exp_problem_totals[!is.na(exp_problem_totals$sample_ID),] # remove NA rows
+
+# compare total ants from both sources
+sum(tmp_totals_comparison[,3], na.rm = T); sum(tmp_totals_comparison$total_ants_sp, na.rm = T)
+# percentage of difference between the 2 totals
+1-(sum(tmp_totals_comparison$total_ants_sp, na.rm = T)/sum(tmp_totals_comparison[,3], na.rm = T))
+
+## comparing totals at each bait
+
+# from corr_exp_data, filter lab totals at each concentration
+tmp_exp_lab_counts <- corr_exp_data %>%
+  filter(count_time == "Lab") %>%
+  dplyr::select(sample_ID, concentration, individuals) %>%  # keep only relevant columns
+  rename(lab_count = individuals)  # rename the individuals column
+
+tmp_totals_bait_comparison <- cbind(sp_totals_bait, tmp_exp_lab_counts$lab_count)
+
+# compare total ants from both sources
+sum(tmp_totals_bait_comparison$total_ants_sp_bait, na.rm = T); sum(tmp_totals_bait_comparison[,4], na.rm = T)
+
+# extract experiments where the total from the lab counting and the total from the species data does not match
+baits_problem_totals <- tmp_totals_bait_comparison[tmp_totals_bait_comparison[,4] != tmp_totals_bait_comparison[,3],]
+baits_problem_totals <- baits_problem_totals[!is.na(baits_problem_totals$sample_ID),] # remove NA rows
+```
+
+There are some minor discrepancies (less than 1% of the total number of ants) between the lab total and the species data total. Since a higher proportion of the species data was counted using a click counter, I consider the species data counts to be more reliable and use these as the variable for analysis over the lab totals when working with the number of ants collected at the end of the experiment.
+
+In order to keep my global environment as clean as possible and without too many variables with similar names at once, I periodically remove all variables labeled as temporary (name starts with prefix "tmp_") from the global environment.
+
+```{r 0.2.1.6 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+
+##### 0.2.2 Scaling the number of ants collected  
+
+The number of ants collected at the end of each experiment does not account for absolute differences in abundance due to ant colony size or foraging strategy (e.g., solitary foraging vs mass recruiting). Both are important features of ant foraging and vary between species (among other factors).
+
+In order to account for this as best as possible, I create scaled measures of ant activity which account for these absolute differences in abundances and which are appropriate for each research question.
+
+ - **Research question 1:** I am looking at whether ant foraging activity is influenced by environmental conditions. For this question, I consider the total amount of ants present at the end of each experiment (all baits pooled together). In order to account for species differences in colony size and foraging strategy, I create a scaled variable to measure species-level foraging activity.  
+    + For each experiment, I calculate the number of ants of species i collected at the end of experiment j and offset it by the maximum number of ants of species i found on any experiment.  
+    + This gives me a rate for foraging activity per species for each experiment, and I can test whether this activity changes under different environmental conditions.  
+    + In terms of data, this means I have 1 row per species per experiment.  
+
+```{r 0.2.2.1 table per species per experiment}
+# sum all ants of the same species of each experiment together
+tmp_species_per_exp <- corr_species_data %>%
+  group_by(sample_ID, sp_abbr) %>%   # for now we group by abbreviated species name
+  dplyr::summarize(individuals = sum(individuals, na.rm = T), .groups = "drop")
+
+# List of all unique species
+tmp_all_species <- unique(corr_species_data$sp_abbr)
+
+# Create an empty data frame with 1 species per exp
+species_per_exp <- expand.grid(
+  sample_ID = unique(env_data$sample_ID), # take sample ID column from env_data to have all 239 experiments
+  sp_abbr = tmp_all_species) %>%
+  arrange(sample_ID)
+
+# Merge this complete data frame with species counts
+species_per_exp <- left_join(species_per_exp, tmp_species_per_exp, 
+                                   by = c("sample_ID", "sp_abbr")) 
+
+# update species table with rows where no ants were found
+species_per_exp <- species_per_exp %>%
+  left_join(sp_totals, by = c("sample_ID")) %>%  # join species totals calculated in chunk 0.2.1.4
+  mutate(individuals = case_when(
+    is.na(individuals) & total_ants_sp == 0 ~ 0,  # True zero: No ants on this bait
+    is.na(individuals) & !is.na(total_ants_sp) ~ 0,  # Species not found → Absence is zero
+    is.na(individuals) & is.na(total_ants_sp) ~ NA,  # Preserve true missing values
+    .default = individuals)) %>%            # Keep original values  )) %>%
+  dplyr::select(-total_ants_sp)             # Drop extra column
+
+# check sum of individuals is the same as in corr_species_data & all sample IDs from env_data are there
+sum(species_per_exp$individuals, na.rm = T) == sum(corr_species_data$individuals, na.rm = T) 
+all(unique(species_per_exp$sample_ID) == env_data$sample_ID)
+
+# compare number of rows where total = NA with the sp_totals (nrow with NAs/number of species)
+nrow(species_per_exp[is.na(species_per_exp$individuals),])/length(tmp_all_species) == nrow(sp_totals[is.na(sp_totals$total_ants_sp),])
+all(unique(species_per_exp$sample_ID[is.na(species_per_exp$individuals)]) == sp_totals$sample_ID[is.na(sp_totals$total_ants_sp)])
+```
+
+```{r 0.2.2.2 scaling per species per experiment}
+# extract maximum number of ants of each species found on any experiment
+scaled_species_exp <- species_per_exp %>%
+  group_by(sp_abbr) %>%
+  mutate(species_max = max(individuals, na.rm = T)) %>% # add new column with max individuals of that genus across baits
+  ungroup()  # remove grouping by species
+
+# add column with scaled ant total per species
+scaled_species_exp <- scaled_species_exp %>%
+  mutate(scaled_species_total = (individuals/species_max))
+```
+
+
+ - **Research question 2:** I am testing whether ants can differentiate between 5 baits of different sugar concentrations in one experiment and whether they forage more intensively on higher sugar concentrations. For this question, I look at the amount of ants collected on each bait at the end of one experiment. To account for species differences within each experiment, I create a scaled variable to measure species-level activity within each experiment.
+    + For each experiment, I calculate the number of ants of species i on concentration j / the total number of ants of species i on that experiments (sum of all concentrations).  
+    + In other words, I look at the proportion of ants of each species on each bait of one experiment.  
+    + In terms of data, this means I have 1 row per species per concentration per experiment.
+    + I can also calculate overall ant activity, without looking at species differences, by simply calculating the proportion of ants on each bait of one experiment, i.e. the number of ants on bait j / the total number of ants on the experiment (sum of all baits).  
+    
+```{r 0.2.2.3 table per species per bait per exp}
+# sum all ants of the same species on each bait of the same experiment together
+tmp_species_per_bait <- corr_species_data %>%
+  group_by(sample_ID, concentration, sp_abbr) %>%   # for now we group by abbreviated species name
+  dplyr::summarize(individuals = sum(individuals, na.rm = T), .groups = "drop")
+
+# List of all unique species
+tmp_all_species <- unique(corr_species_data$sp_abbr)
+
+# Create an empty data frame with 1 species per concentration per exp.
+species_per_bait <- expand.grid(
+  sample_ID = unique(env_data$sample_ID), # take sample ID column from env_data to have all 239 experiments
+  concentration = unique(corr_exp_data$concentration),  # take concentration column from exp data to have all 5 []
+  sp_abbr = tmp_all_species) 
+
+# Merge this complete data frame with species counts
+species_per_bait <- left_join(species_per_bait, tmp_species_per_bait, 
+                                   by = c("sample_ID", "concentration", "sp_abbr")) %>%
+  arrange(sample_ID, concentration)
+
+# update species table with rows where no ants were found
+species_per_bait <- species_per_bait %>%
+  left_join(sp_totals_bait, by = c("sample_ID", "concentration")) %>%  # join species totals per bait calculated in chunk 0.2.4
+   mutate(individuals = case_when(
+    is.na(individuals) & total_ants_sp_bait == 0 ~ 0,  # True zero: No ants on this bait
+    is.na(individuals) & !is.na(total_ants_sp_bait) ~ 0,  # Species not found → Absence is zero
+    is.na(individuals) & is.na(total_ants_sp_bait) ~ NA,  # Preserve true missing values
+    .default = individuals)) %>%            # Keep original values  )) %>%
+  dplyr::select(-total_ants_sp_bait)             # Drop extra column
+
+# check sum of individuals is the same as in corr_species_data & all sample IDs from env_data are there
+sum(species_per_bait$individuals, na.rm = T) == sum(corr_species_data$individuals, na.rm = T) 
+all(unique(species_per_bait$sample_ID) == env_data$sample_ID)
+
+# compare number of rows where total = NA with the sp_totals (nrow with NAs/number of species)
+nrow(species_per_bait[is.na(species_per_bait$individuals),])/length(tmp_all_species) == nrow(sp_totals_bait[is.na(sp_totals_bait$total_ants_sp_bait),])
+all(unique(species_per_bait$sample_ID[is.na(species_per_bait$individuals)]) == unique(sp_totals_bait$sample_ID[is.na(sp_totals_bait$total_ants_sp_bait)]))
+
+# calculate species total per bait
+tmp_sp_bait_total <- species_per_bait %>%
+  group_by(sample_ID, concentration) %>%
+  dplyr::summarize(individuals = sum(individuals), .groups = "drop")
+
+# control that species_per_bait has the same totals as species totals per bait
+which(tmp_sp_bait_total$individuals != sp_totals_bait$total_ants_sp_bait)
+```
+
+```{r 0.2.2.4 scaling per species per bait per exp}
+# extract total number of ants of each species found on any experiment
+scaled_species_bait <- species_per_bait %>%
+  group_by(sample_ID, sp_abbr) %>%
+  mutate(species_total_exp = ifelse(all(is.na(individuals)), NA, sum(individuals, na.rm = TRUE)), # add new column with total individuals of that species per experiment, keep all values as NA if the entire experiment has missing values
+         scaled_species_total = case_when(
+           !is.na(individuals) & species_total_exp == 0 ~ 0,  # avoid divisions by 0
+           is.na(individuals) ~ NA,                           # keep NA values
+           .default = individuals / species_total_exp)) %>%    # scaled value
+  ungroup()  # remove grouping by species
+
+```
+
+```{r 0.2.2.5 scaling overall ant activity per bait}
+scaled_totals_bait <- sp_totals_bait %>%
+  group_by(sample_ID) %>%
+  mutate(ant_total_exp = ifelse(all(is.na(total_ants_sp_bait)), NA, sum(total_ants_sp_bait, na.rm = TRUE)), # add new column with total individuals per experiment, keep all values as NA if the entire experiment has missing values
+         scaled_ant_total = case_when(
+           !is.na(total_ants_sp_bait) & ant_total_exp == 0 ~ 0,  # avoid divisions by 0
+           is.na(total_ants_sp_bait) ~ NA,                       # keep NA values
+           .default = total_ants_sp_bait / ant_total_exp)) %>%   # scaled value
+  ungroup()  # remove grouping by species
+
+```
+
+    
+ - **Research question 3:** this research question is different from the previous in that here, I am looking at what happens during the baiting experiment. As a follow-up to question 3, if ants can differentiate between different sugar concentrations, I want to test how fast this differentiation happens. If there is a preference for higher sugar concentrations, does it establish immediately or over time ? For this question, I look at all ants present on one experiment at one counting time point and see what proportion of these ants is found on each bait. Since this counted during the experiment, there is no species information so I cannot use species as a scaling factor.  
+    + Instead, for each experiment, I calculate the number of ants on bait j at time point h / the total number of ants on the experiment (sum of all baits) at time point h.  
+    + This gives me the proportion of ants on each sugar concentration bait at time point h.  
+    + In terms of data, I have 1 row per time point (5, 10, 20, 40, 80, 120 minutes) per concentration (0, 5, 10, 20, 40%) per experiment.  
+    
+```{r 0.2.2.6 ant scaling per time point}
+# select relevant columns and count times
+scaled_timecount <- corr_exp_data %>%
+  select(sample_ID, concentration, count_time, individuals) %>% # keep only relevant columns
+  filter(count_time %in% c(5, 10, 20, 40, 80, 120))  # remove frozen and lab counts
+
+# calculate total ants per time point + scaled column
+scaled_timecount <- scaled_timecount %>%
+  group_by(sample_ID, count_time) %>%
+  mutate(total_ants_time = sum(individuals, na.rm = T)) %>%  # count total of ants at each time point
+  ungroup() %>%
+  mutate(scaled_ants_time = case_when(                      # add scaled column
+           !is.na(individuals) & total_ants_time == 0 ~ 0,  # avoid divisions by 0
+           is.na(individuals) ~ NA,                           # keep NA values
+           .default = individuals / total_ants_time))    # scaled value
+```
+
+
+```{r 0.2.2.6 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+
+#### 0.3 Preparation of environmental data
+
+```{r 0.3.0 creating new env data frame}
+# create a data frame with only relevant columns for analysis
+cut_env_data <- env_data %>%
+  select(sample_ID, date, date_time, start_time, end_time, climate_logger_ID, 
+         latitude, longitude, city, site, temperature, weather, shade, wind, 
+         imp_mean, imp_median, imp_stdev, imp_min, imp_max, t1_mean, t1_max, t1_min, 
+         t1_sd, t1_var, t2_mean, t2_max, t2_min, t2_sd, t2_var, t3_mean, t3_max, 
+         t3_min, t3_sd, t3_var, raw_moist_mean, raw_moist_max, raw_moist_min, 
+         raw_moist_sd, raw_moist_var, vol_moist_mean, vol_moist_max, vol_moist_min, 
+         vol_moist_sd, vol_moist_var)
+```
+
+##### 0.3.1 Time and date data
+
+Both time and date data need to be converted into numerical values in order to run the statistical analysis.
+
+For the time data, I filter the env_data Google Sheet and see that the earliest experiment start time is 08:10, and the latest is 18:36. I can turn the time of day data into numerical data by converting the time data into minutes since 8 AM. 
+
+```{r 0.3.1.1 Time data}
+# adding a new column to the table with minutes since 8 am
+cut_env_data <- cut_env_data %>%
+  mutate(minutes_since_8am = (hour(start_time) * 60 + minute(start_time)) - (8 * 60)) %>%
+  relocate(minutes_since_8am, .after = end_time)  #  re-order columns
+
+# View transformed time column
+head(cut_env_data[, c("start_time", "minutes_since_8am")])
+```
+
+For the date data, I can convert it into numerical values by finding the earliest experiment day and considering it as day 1 and assigning numbers to all subsequent days relative to the first experiment day. I am using this method instead of considering January 1st as day 1 because 2024, unlike 2023 and 2022, was a leap year so it has 1 more day in February.
+
+```{r 0.3.1.2 Date data}
+# Create a new column that maps each date to a fixed year (e.g., 1999)
+# This ensures that only the month and day are considered.
+cut_env_data <- cut_env_data %>%
+  mutate(date_day_month = as.Date(paste0("1999-", format(date, "%m-%d")))) %>%
+  relocate(date_day_month, .before = start_time)  #  re-order columns
+
+# Find the earliest day (month and day) across all experiments in the fixed-year space
+tmp_first_experiment_fixed <- min(cut_env_data$date_day_month, na.rm = T)
+
+# Create a new column with the relative day (with the earliest experiment as day 1)
+# Create a year column
+cut_env_data <- cut_env_data %>%
+  mutate(relative_day = as.numeric(difftime(date_day_month, tmp_first_experiment_fixed, units = "days")) + 1,
+         year = year(date)) %>%
+  relocate(relative_day, .before = start_time) %>%
+  relocate(year, .after = date_time)  #  re-order columns
+
+# Check the results
+head(cut_env_data[, c("date", "date_day_month", "relative_day")])
+```
+
+
+```{r 0.3.1.3 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+
+##### 0.3.2 Weather conditions data
+
+In the Ant Picnic data sheets, the information regarding the presence or absence of rain during the experiment and the level of cloud cover were merged into a "weather" category, combining the 4 possibilities of "no clouds", "lightly cloudy", "very cloudy" and "rain". For my analysis, I need to dissociate the presence/absence of rain (a binary variable) from the cloud cover level.
+
+All experiments with rain were also very cloudy. Therefore, I can add a "rain" column and replace the "rain, very cloudy" entries with very cloudy in the newly renamed "clouds" column.
+
+```{r 0.3.2.1 separating rain and clouds}
+# view the levels of the weather column
+levels(as.factor(cut_env_data$weather)) # all rainy exp were also very cloudy
+
+# create new rain column and rename weather column
+cut_env_data <- cut_env_data %>%
+  mutate(rain = if_else(weather == "rain, very cloudy", "rain", "no rain"), 
+         weather = if_else(weather == "rain, very cloudy", "very cloudy", weather)) %>%
+  rename(clouds = weather)  %>%  # renaming the weather column
+  relocate(rain, .after = wind)  #  re-order columns
+
+# check known experiments with rain
+print(cut_env_data[cut_env_data$sample_ID %in% c("23-22001", "23-22003","23-22007", "24-11083", "24-11084", "24-11085", "24-11086"), c("clouds", "rain")])
+
+# check that number of experiments with rain = 7
+nrow(na.omit(cut_env_data[cut_env_data$rain == "rain", c("sample_ID", "clouds", "rain")]))
+```
+
+I also need to encode my categorical variables as numbers for later analysis. For rain, it is coded as 0 = no rain and 1 = rain. For clouds, wind, and shade, it is coded as 1 = none, 2 = intermediate (light wind/clouds, half-shade), 3 = very (or full for shade).
+
+```{r 0.3.2.2 numerical coding of weather variables}
+# check the levels for all categorical variables
+levels(as.factor(cut_env_data$clouds)) 
+levels(as.factor(cut_env_data$wind)) 
+levels(as.factor(cut_env_data$shade))
+levels(as.factor(cut_env_data$rain)) 
+
+# recode the categorical columns
+cut_env_data <- cut_env_data %>%
+  mutate(clouds_numeric = dplyr::recode(clouds, 
+                                 "no clouds" = 1, 
+                                 "lightly cloudy" = 2, 
+                                 "very cloudy" = 3),
+         wind_numeric = dplyr::recode(wind,
+                               "no wind" = 1,
+                               "weak wind" = 2,
+                               "strong wind" = 3),
+         shade_numeric = dplyr::recode(shade, 
+                                "no shade" = 1,
+                                "half-shade" = 2,
+                                "full shade" = 3),
+         rain_numeric = dplyr::recode(rain,
+                               "no rain" = 0,
+                               "rain" = 1)) %>%  
+  relocate(c(clouds_numeric, wind_numeric, shade_numeric, rain_numeric), .after = rain)  #  re-order columns
+
+```
+
+#### 0.4 Creating data frames for analysis
+
+To answer my research questions 1 (see below), I need a table which combines the scaled number of ants per species per experiment and the environmental data. I also ensure the variable formats are correct.
+
+```{r 0.4.1 data frame for RQ 1}
+# add env data to scaled species per exp
+env_analysis <- scaled_species_exp %>%
+  left_join(cut_env_data, by = c("sample_ID")) 
+
+# making sure all columns have the right formats
+env_analysis <- env_analysis %>%
+  mutate(across(c("sample_ID", "sp_abbr", "climate_logger_ID", "city", "site"), as.factor),
+         clouds = factor(clouds, levels = c("no clouds", "lightly cloudy", "very cloudy")),  # specify order of factor levels
+         shade = factor(shade, levels = c("no shade", "half-shade", "full shade")),
+         wind = factor(wind, levels = c("no wind", "weak wind", "strong wind")),
+         rain = factor(rain, levels = c("no rain", "rain")),
+         across(c("individuals", "species_max", "scaled_species_total", "year", 
+                  "relative_day", "minutes_since_8am", "latitude", "longitude", 
+                  "temperature"), as.numeric),
+         across(c(24:57), as.numeric)) # set all imp and climate logger variables to numeric
+
+str(env_analysis)
+```
+
+To answer my research question 2 (see below), I need a table which combines the scaled number of ants per species per bait per experiment and the "site" variables which will be modeled as a random effect. I also add a "presence" column which records whether there was > 0 ants present on the baits and ensure the variable formats are correct.
+ 
+```{r 0.4.2 data frame for RQ 2}
+# adding a site column for the random effect + a presence column
+sugar_analysis <- scaled_species_bait %>%
+  left_join(env_data[,c("sample_ID", "site")], by = c("sample_ID")) %>%  # add site column
+  mutate(presence = ifelse(individuals > 0, 1, 0)) %>%  # add presence/absence column
+  relocate(presence, .before = site)
+
+# making sure all columns have the right formats
+sugar_analysis <- sugar_analysis %>%
+  mutate(across(c("sample_ID", "sp_abbr", "site"), as.factor),
+         across(c("individuals", "concentration", "species_total_exp", "scaled_species_total", 
+                  "presence"), as.numeric))
+
+str(sugar_analysis)
+
+# data frame for overall activity (not species-level)
+sugar_analysis_overall <- scaled_totals_bait %>%
+  left_join(env_data[,c("sample_ID", "site")], by = c("sample_ID")) %>%
+  rename(individuals = total_ants_sp_bait) %>% 
+  mutate(presence = ifelse(individuals > 0, 1, 0)) %>%  # add presence/absence column
+  relocate(presence, .before = site)
+
+# making sure all columns have the right formats
+sugar_analysis_overall <- sugar_analysis_overall %>%
+  mutate(across(c("sample_ID", "site"), as.factor),
+         across(c("individuals", "concentration", "ant_total_exp", "scaled_ant_total", 
+                  "presence"), as.numeric))
+
+str(sugar_analysis_overall)
+```
+
+For research question 3, I need a table which combines the scaled number of ants per counting time point per experiment and the "site" variables which will be modeled as a random effect. I also add a "presence" column which records whether there was > 0 ants present on the baits and ensure the variable formats are correct.
+
+```{r 0.4.3 data frame for RQ 3}
+# add site and presence column to scaled_timecount
+speed_analysis <- scaled_timecount %>%
+  left_join(env_data[,c("sample_ID", "site")], by = c("sample_ID")) %>%  # add site column  
+  mutate(presence = ifelse(individuals > 0, 1, 0)) %>%  # add presence/absence column
+  relocate(presence, .before = site)
+
+# making sure all columns have the right formats
+speed_analysis <- speed_analysis %>%
+  mutate(across(c("sample_ID", "concentration", "site"), as.factor),
+         across(c("count_time", "individuals", "total_ants_time", "scaled_ants_time", 
+                  "presence"), as.numeric))
+
+str(speed_analysis)
+```
+
+#### 0.5 General data visualization
+
+##### 0.5.1 Validating citizen science data
+
+Since the Ant Picnic experiments were conducted both by citizens and a scientist, it is interesting to compare the accuracy of some aspects of the data between citizen participants and scientists. Moreover, it is interesting to check how the participant-recorded measures such as temperature compare with the climate logger.
+
+I start by comparing the microclimate logger temperatures (both ground temperature and aboveground temperature) with the participant-recorded temperatures (from a weather app).
+
+```{r 0.5.1.1 accuracy of temperature measures}
+# ground temperature vs weather app temperature, per year
+(tmp_t2_temp_plot <- ggplot(na.omit(env_analysis), aes(x = temperature, y = t2_mean, color = as.factor(year)))+
+   geom_point(size = 0.5)+
+   geom_smooth(method = lm, se = F, linewidth = 0.5)+
+   geom_abline(linetype = 2, color = "red", linewidth = 0.5)+ # add 1:1 identity line in red and dashed
+   scale_color_paletteer_d("nationalparkcolors::Acadia",  # Apply Acadia discrete color scale
+                           guide = guide_legend(title.position = "top", title.hjust = 0.5)) + # center the title
+   labs(x = "Weather app temperature (\u00B0C)", 
+        y = "Ground temperature\n(microclimate logger) (\u00B0C)", color = "Year") +
+   theme_classic2() +
+   theme(legend.text = element_text(size = 9),  # Smaller legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.6, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_text(size = 10, margin = margin(t = 10)),  # adjust distance from axis title to axis
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5)) # adjust distance from axis title to axis, center title
+ )
+
+# above ground temperature vs weather app temperature, per year
+(tmp_t3_temp_plot <- ggplot(na.omit(env_analysis), aes(x = temperature, y = t3_mean, color = as.factor(year)))+
+   geom_point(size = 0.5)+
+   geom_smooth(method = lm, se = F, linewidth = 0.5)+
+   geom_abline(linetype = 2, color = "red", linewidth = 0.5)+ # add 1:1 identity line in red and dashed
+   scale_color_paletteer_d("nationalparkcolors::Acadia",  # Apply Acadia discrete color scale
+                           guide = guide_legend(title.position = "top", title.hjust = 0.5)) + # center the title
+   labs(x = "Weather app temperature (\u00B0C)", 
+        y = "Aboveground temperature\n(microclimate logger) (\u00B0C)", color = "Year") +
+   theme_classic2() +
+   theme(legend.text = element_text(size = 9),  # Smaller legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.6, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_text(size = 10, margin = margin(t = 10)),  # adjust distance from axis title to axis
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5)) # adjust distance from axis title to axis, center title
+ )
+
+# combine both plots
+(tmp_temp_per_year_grouped_plot <- tmp_t2_temp_plot + tmp_t3_temp_plot +
+    plot_layout(nrow = 1, guides = "collect") + plot_annotation(tag_levels = 'a', tag_suffix = ")") &
+    theme(legend.position = "bottom", legend.box = "vertical"))
+
+# ground temp vs weather app temperature, all years pooled
+(tmp_t2_temp_all_plot <- ggplot(na.omit(env_analysis), aes(x = temperature, y = t2_mean))+
+   geom_point(color = "black", size = 0.5)+
+   geom_smooth(method = lm, se = F, , color = "black", linewidth = 0.5)+
+   geom_abline(linetype = 2, color = "red", linewidth = 0.5)+ # add 1:1 identity line in red and dashed
+   labs(x = "Weather app temperature (\u00B0C)", 
+        y = "Ground temperature\n(microclimate logger) (\u00B0C)") +
+   theme_classic2() +
+   theme(axis.title.x = element_text(size = 10, margin = margin(t = 10)),  # adjust distance from axis title to axis
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5)) # adjust distance from axis title to axis, center title
+ )
+
+# aboveground temp vs weather app temperature, all years pooled
+(tmp_t3_temp_all_plot <- ggplot(na.omit(env_analysis), aes(x = temperature, y = t3_mean))+
+   geom_point(color = "black", size = 0.5)+
+   geom_smooth(method = lm, se = F, color = "black", linewidth = 0.5)+
+   geom_abline(linetype = 2, color = "red", linewidth = 0.5)+ # add 1:1 identity line in red and dashed
+   labs(x = "Weather app temperature (\u00B0C)", 
+        y = "Aboveground temperature\n(microclimate logger) (\u00B0C)") +
+   theme_classic2() +
+   theme(axis.title.x = element_text(size = 10, margin = margin(t = 10)),  # adjust distance from axis title to axis
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5)) # adjust distance from axis title to axis, center title
+ )
+
+# combine both plots
+(tmp_temp_all_years_grouped_plot <- tmp_t2_temp_all_plot + tmp_t3_temp_all_plot +
+    plot_layout(nrow = 1) + plot_annotation(tag_levels = 'a', tag_suffix = ")")) 
+```
+
+It appears that all temperature measures correlate fairly well, with ground temperatures usually being a bit warmer than weather app temperatures, especially at lower temperatures.
+
+I can also compare the counting accuracy between citizens and a scientist, both at the end of the experiment while collecting the ants (120 minutes) and after freezing with the number of ants counted in the lab during species identification.
+
+```{r 0.5.1.2 ant count accuracy}
+# add a citizen vs scientist column
+tmp_count_accuracy <- exp_totals %>%
+  dplyr::select(1:3) %>%
+  left_join(sp_totals, by = "sample_ID") %>%  # add lab totals from species data
+  filter(total_ants_sp > 0) %>%   # only keep rows with ants
+  mutate(experimenter = case_when(    # create new experimenter column
+    grepl("^22-|^23-", sample_ID) ~ "citizens",  # if sample ID starts with 22 or 23, assign citizen
+    grepl("^24-", sample_ID) ~ "scientist",  # if sample ID starts with 24, assign scientist
+    .default = NA_character_  # Assigns NA if none of the conditions match
+  ))
+
+# plot count accuracy after 120 minutes, citizens vs scientist
+(tmp_count_acc_120_plot <- ggplot(na.omit(tmp_count_accuracy), aes(x = total_120, y = total_ants_sp, color = as.factor(experimenter)))+
+   geom_point(size = 0.5)+
+   geom_smooth(method = lm, se = F, linewidth = 0.5)+
+   geom_abline(linetype = 2, color = "red", linewidth = 0.5)+ # add 1:1 identity line in red and dashed
+   scale_color_paletteer_d("nationalparkcolors::Acadia",  # Apply Acadia discrete color scale
+                           guide = guide_legend(title.position = "top", title.hjust = 0.5)) + # center the title
+   scale_x_continuous(limits = c(0, max(tmp_count_accuracy$total_ants_sp, na.rm = T))) +
+   scale_y_continuous(limits = c(0, max(tmp_count_accuracy$total_ants_sp, na.rm = T))) +
+   labs(x = "Number of ants counted\nafter 120 minutes", 
+        y = "Number of ants counted in the lab", color = "Experimenter") +
+   theme_classic2() +
+   theme(legend.text = element_text(size = 9),  # Smaller legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.6, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_text(size = 10, margin = margin(t = 10)),  # adjust distance from axis title to axis
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5)) # adjust distance from axis title to axis, center title
+ )
+
+# plot count accuracy after freezing, citizens vs scientist
+(tmp_count_acc_frozen_plot <- ggplot(na.omit(tmp_count_accuracy), aes(x = total_Frozen, y = total_ants_sp, color = as.factor(experimenter)))+
+   geom_point(size = 0.5)+
+   geom_smooth(method = lm, se = F, linewidth = 0.5)+
+   geom_abline(linetype = 2, color = "red", linewidth = 0.5)+ # add 1:1 identity line in red and dashed
+   scale_color_paletteer_d("nationalparkcolors::Acadia",  # Apply Acadia discrete color scale
+                           guide = guide_legend(title.position = "top", title.hjust = 0.5)) + # center the title
+   scale_x_continuous(limits = c(0, max(tmp_count_accuracy$total_ants_sp, na.rm = T))) +
+   scale_y_continuous(limits = c(0, max(tmp_count_accuracy$total_ants_sp, na.rm = T))) +
+   labs(x = "Number of ants counted\nafter freezing", 
+        y = "Number of ants counted in the lab", color = "Experimenter") +
+   theme_classic2() +
+   theme(legend.text = element_text(size = 9),  # Smaller legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.6, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_text(size = 10, margin = margin(t = 10)),  # adjust distance from axis title to axis
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5)) # adjust distance from axis title to axis, center title
+ )
+
+# combine both plots
+(tmp_count_accuracy_grouped_plot <- tmp_count_acc_120_plot + tmp_count_acc_frozen_plot +
+    plot_layout(nrow = 1, guides = "collect") + plot_annotation(tag_levels = 'a', tag_suffix = ")") &
+    theme(legend.position = "bottom", legend.box = "vertical"))  
+```
+
+Overall, the graph after 120 minutes shows that while ant counts are relatively accurate when few ants are present, counts during the experiment with live ants running around become somewhat wild conjectures when ants are numerous, e.g. above 100 ants. Surprisingly, it appears that citizens were more accurate when counting the ants after 120 minutes than the scientist (me). However, this might be due to the fact that one sample (23-22069) had 159 ants estimated at 120 minutes but only 6 ants counted in the lab.
+
+In my case, part of the inaccuracy comes from the fact that often, many ants were foraging on the baits from underneath the A6 bait card, through the wet card, and were thus invisible when counting before picking up the card. The way I proceeded was to count the visible ants, pick up the card and place it in the resealable bag, and write down whether ants were present under the bait card. When only a few ants were under it and I could clearly count them, I added them to the total, but when too many ants to be able to count were under the card, I only wrote it as a comment instead of making a wild guess as to how many ants were under the card. For example, the strong outlier with > 300 ants in the card is experiment 24-11108, where I counted 76 ants visible at 120 minutes and wrote "lots [of ants] under card" as a comment.
+
+Since I cannot know how the different participants dealt with counts and whether they encountered this issue of ants under the cards at all, it is difficult to know exactly what the difference between me and the citizens is due to.
+
+```{r 0.5.1.3 save the plots, include = F}
+# save the plots for temperature
+ggsave(filename = "../images/data_exploration/t2_vs_Wtemp_year.png",
+    plot = tmp_t2_temp_plot,
+    dpi = 600,
+    height = 7,
+    width = 9,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/t3_vs_Wtemp_year.png",
+    plot = tmp_t3_temp_plot,
+    dpi = 600,
+    height = 7,
+    width = 9,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/t2_3_vs_Wtemp_year.png",
+    plot = tmp_temp_per_year_grouped_plot,
+    dpi = 600,
+    height = 10,
+    width = 15.91,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/t2_vs_Wtemp.png",
+    plot = tmp_t2_temp_all_plot,
+    dpi = 600,
+    height = 7,
+    width = 7,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/t3_vs_Wtemp.png",
+    plot = tmp_t3_temp_all_plot,
+    dpi = 600,
+    height = 7,
+    width = 7,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/t2_3_vs_Wtemp.png",
+    plot = tmp_temp_all_years_grouped_plot,
+    dpi = 600,
+    height = 8,
+    width = 15.91,
+    units = "cm")
+
+# save the plots for count accuracy
+ggsave(filename = "../images/data_exploration/count_accuracy_120.png",
+    plot = tmp_count_acc_120_plot,
+    dpi = 600,
+    height = 7,
+    width = 9.5,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/count_accuracy_frozen.png",
+    plot = tmp_count_acc_frozen_plot,
+    dpi = 600,
+    height = 7,
+    width = 9.5,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/count_accuracy_both.png",
+    plot = tmp_count_accuracy_grouped_plot,
+    dpi = 600,
+    width = 15.91,
+    height = 10,
+    units = "cm")
+```
+
+```{r 0.5.1.4 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+##### 0.5.2 Visualization of ant species and experiment distributions
+
+As I have also identified the species of ants found in the different experiments, I can visualize the diversity of ant species found, whether overall, per year or per species. I plot both the occurence (number of experiments where a species occured) and the number of individuals of each species found.
+
+I also plot the number of experiments done per year and per city.
+
+```{r 0.5.2.1 species and experiment distributions}
+# create table with relevant columns
+tmp_sp_distr <- env_analysis %>%
+  dplyr::select(c(sample_ID, sp_abbr, individuals, date, year, city)) %>%  # select relevant columns
+  filter(individuals > 0 & !is.na(individuals) & !is.na(city))  # only keep rows with ants
+
+# distribution of experiments per year
+(tmp_exp_distr_year_plot <- ggplot(na.omit(cut_env_data), aes(x = as.factor(year), fill = as.factor(year))) +
+  geom_bar(position = "dodge") +  
+  scale_fill_paletteer_d("nationalparkcolors::Acadia") +  # Apply Acadia discrete color scale
+  labs(y = "Number of experiments") +
+   theme_bw() +
+   theme(legend.position = "none",  # set legend text
+        axis.title.x = element_blank(),  # adjust distance from axis title to axis, set text size
+        axis.title.y = element_text(margin = margin(r = 10), size = 10)) # adjust distance from axis title to axis, center title
+)
+
+# distribution of experiments per city
+(tmp_exp_distr_city_plot <- ggplot(na.omit(cut_env_data), aes(x = as.factor(city), fill = as.factor(city))) +
+  geom_bar(position = "dodge") +  
+  scale_fill_paletteer_d("nationalparkcolors::Acadia") +  # Apply Acadia discrete color scale
+  labs(y = "Number of experiments") +
+   theme_bw() +
+   theme(legend.position = "none",  # set legend text
+        axis.title.x = element_blank(),  # adjust distance from axis title to axis, set text size
+        axis.title.y = element_text(margin = margin(r = 10), size = 10)) # adjust distance from axis title to axis, center title
+)
+
+# distribution of experiments per year and per city
+(tmp_exp_distr_year_city_plot <- ggplot(na.omit(cut_env_data), aes(x = as.factor(year), fill = as.factor(city))) +
+  geom_bar(position = "dodge") +  
+  scale_fill_paletteer_d("nationalparkcolors::Acadia") +  # Apply Acadia discrete color scale
+  labs(y = "Number of experiments", fill = "City") +
+   theme_bw() +
+   theme(legend.text = element_text(size = 9),  # set legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_blank(),  # adjust distance from axis title to axis, set text size
+        axis.title.y = element_text(margin = margin(r = 10), size = 10)) # adjust distance from axis title to axis, center title
+)
+
+# distribution of species per year
+(tmp_sp_distr_year_plot <- ggplot(tmp_sp_distr, aes(x = as.factor(year), fill = as.factor(sp_abbr))) +
+  geom_bar(position = "dodge") +  
+  scale_fill_viridis_d() +  # Apply viridis discrete color scale
+  labs(x = "Number of species occuring each year", 
+        y = "Number of experiments", fill = "Species") +
+   theme_bw() +
+   theme(legend.text = element_text(size = 8, face = "italic"),  # set legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.3, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_text(margin = margin(t = 10), size = 10),  # adjust distance from axis title to axis, set text size
+        axis.title.y = element_text(margin = margin(r = 10), size = 10))+ # adjust distance from axis title to axis, center title
+    guides(fill = guide_legend(ncol = 1))  # Set legend to 1 column
+)
+
+# distribution of species per city
+(tmp_sp_distr_city_plot <- ggplot(tmp_sp_distr, aes(x = as.factor(city), fill = as.factor(sp_abbr))) +
+  geom_bar(position = "dodge") +  
+  scale_fill_viridis_d() +  # Apply viridis discrete color scale
+  labs(x = "Number of species occuring in each city", 
+        y = "Number of experiments", fill = "Species") +
+   theme_bw() +
+   theme(legend.text = element_text(size = 8, face = "italic"),  # set legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.3, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_text(margin = margin(t = 10), size = 10),  # adjust distance from axis title to axis, set text size
+        axis.title.y = element_text(margin = margin(r = 10), size = 10))+ # adjust distance from axis title to axis, center title
+    guides(fill = guide_legend(ncol = 1))  # Set legend to 1 column
+)
+
+# overall species occurrence
+(tmp_species_occ_plot <- ggplot(tmp_sp_distr, aes(x=sp_abbr, fill = sp_abbr))+  
+    geom_bar()+ 
+    scale_fill_viridis_d()+
+    labs(y = "Number of experiments") +
+    theme_classic()+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 8, face = "italic"),
+          legend.position = "none",
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 10, margin = margin(r = 15), hjust = 0.5)) # adjust distance from axis title to axis, center title
+)
+
+# number of ants per species
+(tmp_species_ind_plot <- ggplot(tmp_sp_distr, aes(x=sp_abbr, y=individuals, fill = sp_abbr))+  
+    geom_col()+ 
+    scale_fill_viridis_d()+
+    labs(y = "Number of ant individuals") +
+    theme_classic()+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 8, face = "italic"),
+          legend.position = "none",
+          axis.title.x = element_blank(),  # adjust distance from axis title to axis
+          axis.title.y = element_text(size = 10, margin = margin(r = 15), hjust = 0.5)) # adjust distance from axis title to axis, center title
+)
+
+(tmp_species_grouped_plot <- tmp_species_ind_plot + tmp_species_occ_plot +
+    plot_layout(nrow = 2) + plot_annotation(tag_levels = 'a', tag_suffix = ")"))
+```
+
+Since I visited the 9 sites of my 2024 fieldwork 3 times over the span of 3 months, we can also plot the species diversity by month and by site for the 2024 experiments.
+
+```{r 0.5.2.2 distribution of 2024 species per site}
+# create table with relevant columns and rows
+tmp_sp_distr_24 <- env_analysis %>%
+  dplyr::select(c(sample_ID, sp_abbr, individuals, date_day_month, year, site)) %>%  # select relevant columns
+  filter(individuals > 0 & !is.na(individuals) & year == 2024 & month(date_day_month) != 4) %>%  # only keep rows with ants and 2024 data
+  mutate(month = case_when(    # create new month column
+    (month(date_day_month) == 5 | as.character(date_day_month) == "1999-06-04") ~ "May",  
+    (as.character(date_day_month) != "1999-06-04" & month(date_day_month) == 6) ~ "June",
+    month(date_day_month) > 6 ~ "July",
+    .default = NULL)) %>%
+  mutate(month = factor(month, levels = c("May", "June", "July")))  # Convert month to factor with ordered levels
+
+# Create the plot per month
+(tmp_map_sp24_month <- ggplot(tmp_sp_distr_24, aes(x = month, fill = sp_abbr)) +
+  geom_bar(position = "dodge") +  
+  facet_wrap(~ site) +  
+  scale_fill_viridis_d(option = "D") +  # Apply Viridis discrete color scale
+  labs(x = "Species occurrence per month", y = "Number of experiments per site", fill = "Species") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),  # Rotate x-axis labels
+        legend.text = element_text(size = 8, face = "italic"),  # Smaller legend text
+        legend.title = element_text(size = 10, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.3, "cm"),  # Makes the legend squares smaller
+        strip.text = element_text(size = 8), # Smaller facet labels (location names)
+        axis.title.x = element_text(margin = margin(t = 10), size = 10),  # adjust distance from axis title to axis
+        axis.title.y = element_text(margin = margin(r = 10), size = 10))+ # adjust distance from axis title to axis, center title       
+  guides(fill = guide_legend(ncol = 1))  # Set legend to 1 column
+)
+```
+
+```{r 0.5.2.3 save the plots, include = F}
+# save the plots for distribution of experiments
+ggsave(filename = "../images/data_exploration/distr_exp_year.png",
+    plot = tmp_exp_distr_year_plot,
+    dpi = 600,
+    height = 7,
+    width = 7,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/distr_exp_city.png",
+    plot = tmp_exp_distr_city_plot,
+    dpi = 600,
+    height = 7,
+    width = 7,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/distr_exp_year_city.png",
+    plot = tmp_exp_distr_year_city_plot,
+    dpi = 600,
+    height = 7,
+    width = 9,
+    units = "cm")
+
+# save the plots for distribution of species (city + year)
+ggsave(
+    filename = "../images/data_exploration/distr_species_year.png",
+    plot = tmp_sp_distr_year_plot,
+    dpi = 600,
+    height = 10.5,
+    width = 13,
+    units = "cm")
+
+ggsave(
+    filename = "../images/data_exploration/distr_species_city.png",
+    plot = tmp_sp_distr_city_plot,
+    dpi = 600,
+    height = 10.5,
+    width = 13,
+    units = "cm")
+
+# save the plots for species occurences
+ggsave(filename = "../images/data_exploration/species_occ.png",
+    plot = tmp_species_occ_plot,
+    dpi = 600,
+    height = 9,
+    width = 13,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/species_ind.png",
+    plot = tmp_species_ind_plot,
+    dpi = 600,
+    height = 9,
+    width = 13,
+    units = "cm")
+
+ggsave(filename = "../images/data_exploration/species_grouped.png",
+    plot = tmp_species_grouped_plot,
+    dpi = 600,
+    height = 20,
+    width = 15.91,
+    units = "cm")
+
+# save the plot for distribution of 2024 species
+ggsave(
+    filename = "../images/data_exploration/distr_2024_species_month.png",
+    plot = tmp_map_sp24_month,
+    dpi = 600,
+    height = 12,
+    width = 15.91,
+    units = "cm")
+```
+
+```{r 0.5.2.4 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+##### 0.5.3 Extracting numbers for summary tables
+
+I will summarize the main information such as number of experiments done per city, per year, number of species found, etc., in tables. Here, I extract the values I will need for these tables.
+
+```{r 0.5.3.1 values for descriptive results table}
+# number of species in halle 
+tmp_sp_halle <- env_analysis %>% 
+  filter(city == "Halle", individuals > 0 & !is.na(individuals)) 
+length(unique(tmp_sp_halle$sp_abbr[tmp_sp_halle$year == "2022"])) # number for 2022
+length(unique(tmp_sp_halle$sp_abbr[tmp_sp_halle$year == "2023"])) # number for 2023
+length(unique(tmp_sp_halle$sp_abbr[tmp_sp_halle$year == "2024"])) # number for 2024
+length(unique(tmp_sp_halle$sp_abbr)) # total number of ant species
+
+# number of species in leipzig 
+tmp_sp_leipzig <- env_analysis %>% 
+  filter(city == "Leipzig", individuals > 0 & !is.na(individuals)) 
+length(unique(tmp_sp_leipzig$sp_abbr[tmp_sp_leipzig$year == "2022"])) # number for 2022
+length(unique(tmp_sp_leipzig$sp_abbr[tmp_sp_leipzig$year == "2023"])) # number for 2023
+length(unique(tmp_sp_leipzig$sp_abbr[tmp_sp_leipzig$year == "2024"])) # number for 2024
+length(unique(tmp_sp_leipzig$sp_abbr)) # total number of ant species
+
+# number of species in berlin 
+tmp_sp_berlin <- env_analysis %>% 
+  filter(city == "Berlin", individuals > 0 & !is.na(individuals)) 
+length(unique(tmp_sp_berlin$sp_abbr[tmp_sp_berlin$year == "2022"])) # number for 2022
+length(unique(tmp_sp_berlin$sp_abbr[tmp_sp_berlin$year == "2023"])) # number for 2023
+length(unique(tmp_sp_berlin$sp_abbr[tmp_sp_berlin$year == "2024"])) # number for 2024
+length(unique(tmp_sp_berlin$sp_abbr)) # total number of ant species
+
+# number of species with no location 
+tmp_sp_na <- env_analysis %>% 
+  filter(is.na(city), individuals > 0 & !is.na(individuals)) 
+length(unique(tmp_sp_na$sp_abbr[tmp_sp_na$year == "2022"])) # number for 2022
+length(unique(tmp_sp_na$sp_abbr[tmp_sp_na$year == "2023"])) # number for 2023
+length(unique(tmp_sp_na$sp_abbr[tmp_sp_na$year == "2024"])) # number for 2024
+length(unique(tmp_sp_na$sp_abbr)) # total number of ant species
+
+# number of species per year
+tmp_sp_year <- env_analysis %>% 
+  filter(individuals > 0 & !is.na(individuals)) 
+length(unique(tmp_sp_year$sp_abbr[tmp_sp_year$year == "2022"])) # number for 2022
+length(unique(tmp_sp_year$sp_abbr[tmp_sp_year$year == "2023"])) # number for 2023
+length(unique(tmp_sp_year$sp_abbr[tmp_sp_year$year == "2024"])) # number for 2024
+length(unique(tmp_sp_year$sp_abbr)) # total number of ant species
+```
+
+```{r 0.5.3.2 table of total of individuals per species}
+# obtain the total number of individuals found per species
+tmp_total_ind_per_sp <- corr_species_data %>%
+  select(family, subfamily, genus, species, sp_abbr, individuals) %>%
+  group_by(sp_abbr) %>%
+  summarise(total_sp = sum(individuals, na.rm = T)) %>%
+  arrange(desc(total_sp)) 
+
+# number of exp each species was found on
+tmp_total_exp_per_sp <- env_analysis %>%
+  filter(individuals > 0 & !is.na(individuals)) %>%
+  group_by(sp_abbr) %>%
+  summarise(occurrence = n()) %>%
+  arrange(desc(occurrence)) 
+```
+
+
+```{r 0.5.3.3 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+### 1. Research Question 1
+
+The overarching research question is: is ant foraging activity influenced by environmental conditions and land use ?
+
+More specifically, does the average number of ants collected at the end of the baiting experiments depend on ground temperature, soil moisture, reported weather conditions, time of day, date of experiment, mean impervious surface coverage in a 100-meter radius around the experiment sites, and the interaction of these factors ?
+
+ * *H0*: the average number of ants found at the end of the experiments is influenced by environmental conditions or urbanization
+ * *H1*: the average number of ants found at the end of the experiments is not influenced by environmental conditions or urbanization
+ 
+
+ **Description of tested variables**  
+ 
+  * **Response variable:**   
+      + relative number of ants collected at the end of each ant picnic experiment per species (number of ants of species i collected at the end of experiment j offset by the maximum number of ants of species found on any experiment), quantitative  
+      
+  * **Environmental variables measured:**   
+      + Mean ground temperature recorded by climate loggers over the experiment time, continuous numerical variable    
+      + Mean underground temperature recorded by climate loggers over the experiment time, continuous numerical variable    
+      + Mean above ground temperature recorded by climate loggers over the experiment time, continuous numerical variable    
+      + Temperature recorded by participants using a weather app, discrete numerical variable  
+      + Mean calibrated soil moisture recorded by climate loggers over the experiment time, discrete numerical variable     
+      + Presence or absence of rain, recorded by participants, binary variable  
+      + Reported cloud conditions recorded by participants, ordinal categorical variable      
+      + Shade as recorded by participants, ordinal categorical variable  
+      + Wind conditions as recorded by participants, ordinal categorical variable
+      + Mean impervious surface coverage in a 100m radius around each experiment site, continuous numerical variable    
+      + Time of day of the start of the experiment, with the start time recorded as minutes since 8 am, discrete numerical variable     
+      + Date (day and month) of the experiment, recorded as a relative date (earliest experiment in the year = 1), discrete numerical variable    
+      
+  * **Random effects:**    
+      + Site, nominal categorical variable  
+      + Species, nominal categorical variable  
+      
+#### 1.0 Correlation analysis of environmental variables
+
+I expect several of my explanatory variables, such as the time of day, weather, date, temperature to be correlated. Additionally, I have several measures for temperature. This correlation analysis allows to get a clearer idea of how the variables correlate and of which variables are the most relevant for my analysis.  
+
+I perform two correlation analyses, the first focusing only on the quantitative variables (excluding rain, clouds, shade, wind, city, and year) and the second including all variables. For the first analysis, I want to use the Pearson correlation coefficient, which assumes a linear relationship and that variables are normally distributed with no extreme outliers.
+
+I start by testing the normality of the distribution of my variables as well as checking visually for outliers. From the Q-Q plots, it seems that the variables from the microclimate loggers and the temperature recorded by participants are relatively close to a normal distribution, although with some deviation at extreme values. the impervious surface, experiment start time, and date of experiment show clear deviation from normality. The results of the Shapiro-Wilk test confirm that all variables significantly differ from a normal distribution.  
+
+Since my continuous variables are not normally distributed, both correlation analyses (only quantitative variables, both quantitative and qualitative variables) are run using Spearman’s rank correlation coefficient.
+
+```{r 1.0.1 testing Pearson correlation assumptions}
+#create a data frame with only the numerical variables
+tmp_cor_plot_env_num <- cut_env_data[,c("t1_mean", "t2_mean", "t3_mean", "temperature", "imp_mean", 
+                                   "vol_moist_mean", "minutes_since_8am", 
+                                   "relative_day")]
+
+# remove NAs from data set
+tmp_cor_plot_env_num <- na.omit(tmp_cor_plot_env_num)
+
+#rename variables for plotting
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "t1_mean"] <- "Temperature below ground"
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "t2_mean"] <- "Temperature at ground surface"
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "t3_mean"] <- "Temperature above ground"
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "temperature"] <- "Temperature (participants)"
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "imp_mean"] <- "Impervious surface coverage"
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "vol_moist_mean"] <- "Soil moisture"
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "minutes_since_8am"] <- "Experiment start time"
+names(tmp_cor_plot_env_num)[names(tmp_cor_plot_env_num) == "relative_day"] <- "Date of experiment"
+
+# Checking for normality of variable distributions
+# create empty list
+tmp_qq_plots <- list()
+# plot Q-Q plots for each variable
+for (i in 1:ncol(tmp_cor_plot_env_num)) {
+  tmp_qq_plots[[i]] <- ggplot(tmp_cor_plot_env_num, aes(sample = .data[[colnames(tmp_cor_plot_env_num)[i]]])) +
+  stat_qq()+
+  stat_qq_line()+
+  ggtitle(str_wrap(colnames(tmp_cor_plot_env_num)[i], width = 20))+
+  theme(plot.title = element_text(size = 10))  
+}
+
+# Arrange the plots in a 2-row, 4-column grid
+(tmp_env_qqplot <- wrap_plots(tmp_qq_plots) + plot_layout(nrow = 2, ncol = 4))
+
+# saving the plot
+#ggsave(
+#    filename = "../images/data_exploration/env_var_qqplots.png",
+#    plot = tmp_env_qqplot,
+#    dpi = 300,
+#    height = 12,
+#    width = 20,
+#    units = "cm"
+#  )
+
+# Shapiro-wilk test for normality
+# Create an empty data frame to store results
+tmp_shapiro_results <- data.frame(Variable = character(), P_Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each column in cor_plot_env_num
+for (tmp_i in 1:ncol(tmp_cor_plot_env_num)) {
+  tmp_col_name <- colnames(tmp_cor_plot_env_num)[tmp_i]  # Get the column name
+  tmp_test_result <- shapiro.test(tmp_cor_plot_env_num[[tmp_i]])  # Perform Shapiro-Wilk test
+  
+  # Store results in the data frame
+  tmp_shapiro_results <- rbind(tmp_shapiro_results, data.frame(Variable = tmp_col_name, P_Value = tmp_test_result$p.value))
+}
+
+# Print the variables not significantly 
+print(tmp_shapiro_results)
+```
+
+
+```{r 1.0.2 correlation matrix quantitative}
+# compute the correlation matrix with p-values
+tmp_env_cor_results <- rcorr(as.matrix(tmp_cor_plot_env_num), type = "spearman") 
+
+# extract correlation matrix and print
+tmp_env_cor_matrix <- tmp_env_cor_results$r; tmp_env_cor_matrix
+
+# extract the p-values
+tmp_env_p_matrix <- tmp_env_cor_results$P
+
+# plot correlation matrix (only insignificant ones hidden)
+tmp_corr_num <- corrplot(tmp_env_cor_matrix, 
+         type = "upper",
+         method = "color",
+         diag = F,                         # remove diagonal
+         #addCoef.col = "black",           # add coefficient coeffs, not used 
+         p.mat = tmp_env_p_matrix,         # add p-values matrix
+         sig.level = c(0.001, 0.01, 0.05), # significance thresholds
+         tl.col = "black",                 # color of variable labels
+         cl.align.text = "l",              # alignment of color legend
+         cl.offset = 0.3,                  # offset color legend text to the right
+         number.cex = 0.6,                 # size of coefficient text
+         tl.cex	= 0.7,                     # size of variable labels
+         insig = "label_sig",              # add stars according to significance thresholds
+         pch.cex = 1)                      # size of stars
+
+# save the plot as a png, commented out for knitting of the rmarkdown file
+# dev.copy(png, "../images/data_exploration/correlation_plot_num.png", width = 1600, height = 1600, res = 300)
+# dev.off()
+```
+
+
+```{r 1.0.3 correlation matrix all variables}
+#create a data frame with only the numerical variables
+tmp_cor_plot_env_all <- cut_env_data[,c("t1_mean", "t2_mean", "t3_mean", "temperature", 
+                                        "imp_mean", "vol_moist_mean", "minutes_since_8am", 
+                                        "relative_day", "clouds_numeric", "shade_numeric", 
+                                        "wind_numeric", "rain_numeric", "year", "city")]
+
+tmp_cor_plot_env_all <- tmp_cor_plot_env_all %>%
+  # Code the city variable as numbers
+  mutate(city = dplyr::recode(city, "Halle" = 1, "Leipzig" = 2, "Berlin" = 3)) %>%
+  # Remove NAs
+  na.omit() %>%
+  # Rename variables for plotting
+  rename(
+    "Temperature below ground" = t1_mean,
+    "Temperature at ground surface" = t2_mean,
+    "Temperature above ground" = t3_mean,
+    "Temperature (participants)" = temperature,
+    "Impervious surface coverage" = imp_mean,
+    "Soil moisture" = vol_moist_mean,
+    "Experiment start time" = minutes_since_8am,
+    "Date of experiment" = relative_day,
+    "Year" = year,
+    "Cloud cover (participants)" = clouds_numeric,
+    "Shade (participants)" = shade_numeric,
+    "Wind (participants)" = wind_numeric,
+    "Rain (participants)" = rain_numeric,
+    "City" = city)
+
+# compute the correlation matrix with p-values
+tmp_env_cor_all_results <- rcorr(as.matrix(tmp_cor_plot_env_all), type = "spearman") 
+
+# extract correlation matrix and print results
+tmp_env_cor_all_matrix <- tmp_env_cor_all_results$r
+
+# extract the p-values and print results
+tmp_env_p_all_matrix <- tmp_env_cor_all_results$P
+
+# plot correlation matrix (only insignificant ones hidden)
+corrplot(tmp_env_cor_all_matrix, 
+         type = "upper",
+         method = "color",
+         diag = F,                         # remove diagonal
+         #addCoef.col = "black",           # add coefficient coeffs, not used 
+         p.mat = tmp_env_p_all_matrix,     # add p-values matrix
+         sig.level = c(0.001, 0.01, 0.05), # significance thresholds
+         tl.col = "black",                 # color of variable labels
+         cl.align.text = "l",              # alignment of color legend
+         cl.offset = 0.3,                  # offset color legend text to the right
+         number.cex = 0.6,                 # size of coefficient text
+         tl.cex	= 0.7,                     # size of variable labels
+         insig = "label_sig",              # add start according to significance thresholds
+         pch.cex = 1)                      # size of stars
+
+# save the plot as a png, commented out for knitting of the rmarkdown file
+# dev.copy(png, "../images/data_exploration/correlation_plot_all.png", width = 1600, height = 1600, res = 300)
+# dev.off()
+```
+
+All temperature measures are highly correlated (r > 0.5), which is a good control and suggests that there are no significant discrepancies in the temperature measures since they align well. For analysis, the ground temperature will be used as the sole temperature variable as it is the measure that should best reflect the temperature experienced by foraging ants.
+
+```{r 1.0.4 correlation matrix 1 Temp variable}
+#create a data frame with only the numerical variables
+tmp_cor_plot_env_t2 <- cut_env_data[,c("t2_mean", "imp_mean", "vol_moist_mean", "minutes_since_8am", 
+                                        "relative_day", "clouds_numeric", "shade_numeric", 
+                                        "wind_numeric", "rain_numeric",
+                                        "year", "city")]
+
+tmp_cor_plot_env_t2 <- tmp_cor_plot_env_t2 %>%
+  # Code the city variable as numbers
+  mutate(city = dplyr::recode(city, "Halle" = 1, "Leipzig" = 2, "Berlin" = 3)) %>%
+  # Remove NAs
+  na.omit() %>%
+  # Rename variables for plotting
+  rename(
+    "Temperature at ground surface" = t2_mean,
+    "Impervious surface coverage" = imp_mean,
+    "Soil moisture" = vol_moist_mean,
+    "Experiment start time" = minutes_since_8am,
+    "Date of experiment" = relative_day,
+    "Year" = year,
+    "Cloud cover (participants)" = clouds_numeric,
+    "Shade (participants)" = shade_numeric,
+    "Wind (participants)" = wind_numeric,
+    "Rain (participants)" = rain_numeric,
+    "City" = city)
+
+# compute the correlation matrix with p-values
+tmp_env_cor_t2_results <- rcorr(as.matrix(tmp_cor_plot_env_t2), type = "spearman") 
+
+# extract correlation matrix and print
+tmp_env_cor_t2_matrix <- tmp_env_cor_t2_results$r; tmp_env_cor_t2_matrix
+
+# extract the p-values
+tmp_env_p_t2_matrix <- tmp_env_cor_t2_results$P
+
+# plot correlation matrix (only insignificant ones hidden)
+corrplot(tmp_env_cor_t2_matrix, 
+         type = "upper",
+         method = "color",
+         diag = F,                         # remove diagonal
+         #addCoef.col = "black",           # add coefficient coeffs, not used
+         p.mat = tmp_env_p_t2_matrix,      # add p-values matrix
+         sig.level = c(0.001, 0.01, 0.05), # significance thresholds
+         tl.col = "black",                 # color of variable labels
+         cl.align.text = "l",              # alignment of color legend
+         cl.offset = 0.3,                  # offset color legend text to the right
+         number.cex = 0.6,                 # size of coefficient text
+         tl.cex	= 0.8,                     # size of variable labels
+         cl.cex = 0.7,                     # size of color legend text
+         insig = "label_sig",              # add start according to significance thresholds
+         pch.cex = 1)                      # size of stars
+
+# save the plot as a png, commented out for knitting of rmarkdown file
+# dev.copy(png, "../images/data_exploration/correlation_plot_T2.png", width = 1600, height = 1600, res = 300)
+# dev.off()
+```
+
+The results of the correlation analysis show:
+
+  * Year and date of experiment are strongly correlated (r = 0.68), and year and city are moderately correlated (r = -0.44). This is expected as the 2024 experiments were only conducted in Leipzig and over a broader range of dates, while the experiments in 2022 and 2023 were conducted in all 3 cities and usually earlier in the year. Year is also moderately correlated to experiment start time (r = 0.31), soil moisture (r = 0.50), and ground temperature (r = 0.38), which may be due to the fact that experiments in 2024 were more spread out over the time of day and the date than in the previous year. This means the year column may reflect trends in seasonal and daily temperature and moisture variations.  
+      + This can be accounted for by adding a "site" variable as a random effect in the models. "Site" represents the location or address where experiments were done and allows to group experiments done at the same school or at the same location for the 2024 fieldwork. Site should account for some of the variation both in year and city as different sites are from different cities and were used in different years.  
+      
+  * Shade and temperature are moderately correlated (r = -0.43), which makes sense since shade lowers ground temperature. The shade variable could be an indirect indication of habitat structure around the baits (i.e., more or less trees around the experiment) or other microclimate characteristics, but it may also provide information which is mostly redundant with temperature. Models with and without shade as a fixed effect are compared below to see if keeping shade as a predictor improves the model or not.
+  
+  * Date of experiment is moderately correlated with temperature (r = 0.48) and soil moisture (r = 0.41), which likely reflects seasonal variations in temperature and weather. 
+  
+  * Experiment start time is moderately correlated with temperature (r = 0.32), which reflects daily variations in temperature.  
+  
+  * Cloud cover is moderately correlated with temperature (r = -0.30), which is to be expected as more cloud cover can have a negative impact on ground temperature.  
+  
+  * Other variables are either weakly (r < 0.3) or non-significantly correlated. 
+      + Impervious surface cover is only weakly negatively correlated with soil moisture (r = -0.15) and with year (r = -0.24) and city (r = 0.24). The correlation with year might be due to the uneven sampling of the three cities over the 3 years. The positive (although weak) correlation with city suggests that impervious surface cover at a local level (100m around experiments) is higher in bigger cities.   
+      + Cloud cover and rain are weakly correlated (r = 0.27), which is relatively logical.  
+      + Rain also correlates weakly with experiment date (r = 0.16), which is likely due to the fact that several experiments were done on one day, so all experiments done in the same location on the same day will share rain presence or absence, while cloud cover or wind conditions may be more subjective.  
+
+A Variance Inflation Factor test can also be run on the variables (city and year removed since they will not be used as fixed effects) and shows that all variables have a VIF < 5, suggesting no significant multicollinearity.
+
+```{r 1.0.5 VIF test}
+tmp_vif_model <- lm(scaled_species_total ~ t2_mean + imp_mean + vol_moist_mean + 
+                                       minutes_since_8am + relative_day +
+                                       clouds_numeric + wind_numeric + 
+                                       shade_numeric + rain_numeric, 
+                data = env_analysis)
+
+vif(tmp_vif_model)  # Run VIF test
+```
+ 
+ 
+```{r 1.0.6 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+#### 1.1 Defining predictor variables for analysis
+ 
+ Based on the correlation analysis, I can define which variables are used as predictors (fixed effects) or random effects. 
+ 
+ * **Response variable (reminder):**   
+      + relative number of ants collected at the end of each ant picnic experiment per species (number of ants of species i collected at the end of experiment j offset by the maximum number of ants of species found on any experiment), quantitative  
+      
+  * **Predictor variables:**    
+      + Temperature  
+          - *Mean ground temperature recorded by climate loggers over the experiment time, continuous numerical variable*    
+      + Soil moisture  
+          - *Mean calibrated (volumetric) soil moisture recorded by climate loggers over the experiment time, continuous numerical variable*     
+      + Impervious surface coverage  
+          - *Mean impervious surface coverage in a 100m radius around each experiment site, continuous numerical variable*    
+      + Experiment start time  
+          - *Time of day of the start of the experiment, with the start time recorded as minutes since 8 am, discrete numerical variable*     
+      + Date of experiment
+          - *Date (day and month) of the experiment, recorded as a relative date (earliest experiment in the year = 1), discrete numerical variable*
+      + Cloud cover
+          - *Reported cloud conditions recorded by participants, ordinal categorical variable, encoded from 1 to 3 (low to high)*      
+      + Wind
+          - *Wind conditions as recorded by participants, ordinal categorical variable, encoded from 1 to 3 (low to high)*
+      + Shade
+          - *Shade as recorded by participants, ordinal categorical variable, encoded from 1 to 3 (low to high)*  
+      
+  * **Random effects:**    
+      + Site, nominal categorical variable  
+      + Species, nominal categorical variable   
+      
+While rain would be an interesting predictor to measure, I am not going to include the absence or presence of rain as a predictor variable because its distribution is very unbalanced in my data: out of 239 experiments, only 7 experiments had rain while 229 did not. 
+
+```{r 1.1.1 distribuion of rain variable}
+table(cut_env_data$rain)
+```
+
+All other predictor variables than rain will be added into the initial model, but several variable combinations will be tested to find the best model fit.
+
+#### 1.2 Exploratory Data Analysis
+
+This section details different visualizations of the data.
+
+##### 1.2.1 Visualizing response variable
+
+```{r 1.2.1.1 distribution of ant counts}
+# distribution of raw ant totals
+ggplot(na.omit(env_analysis), aes(x = individuals)) +
+  geom_histogram(bins = 15, fill = "skyblue", color = "black") +
+  labs(x = "Raw number of ants per species and experiment", y = "Frequency")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme_bw()
+
+# distribution of scaled ant totals
+ggplot(na.omit(env_analysis), aes(x = scaled_species_total))+
+  geom_histogram(bins = 15, fill = "skyblue", color = "black") +
+  labs(x = "Scaled number of ants per species and experiment", y = "Frequency")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme_bw()
+```
+
+
+##### 1.2.2 Visualizing explanatory variables
+
+I can visualize the distributions of continuous explanatory variables as well as the relationship between the response and each variable.
+
+```{r 1.2.2.1 visualizing continuous explanatory variables}
+# histogram of continuous predictors
+na.omit(env_analysis) %>%
+  gather(key = "variable", value = "value", t2_mean, vol_moist_mean, imp_mean) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(fill = "skyblue", color = "black", bins = 20) +
+  facet_wrap(~ variable, scales = "free", labeller = labeller(variable = c(
+    t2_mean = "Ground Temperature (\u00B0C)",
+    vol_moist_mean = "Soil Moisture (%)",
+    imp_mean = "Impervious Surface Cover (%)"))) +
+  labs(title = "Distributions of Continuous Predictors")+
+  theme_bw()
+
+# raw ants vs. ground temperature
+tmp_raw_ant_t2_plot <- ggplot(na.omit(env_analysis), aes(x = t2_mean, y = individuals)) + 
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue") +
+  labs(title = "Raw ant count per species \nvs. Ground temperature", 
+       x = "Ground temperature (\u00B0C)", y = "Raw number of ants per species")+
+  theme_bw()
+
+# Araw nts vs. Soil Moisture
+tmp_raw_ant_moist_plot <- ggplot(na.omit(env_analysis), aes(x = vol_moist_mean, y = individuals)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(title = "Raw ant count per species \nvs. Soil moisture", 
+       x = "Volumetric soil moisture (%)", y = "Raw number of ants per species")+
+  theme_bw()
+
+# raw Ants vs. Impervious Surface
+tmp_raw_ant_imp_plot <- ggplot(na.omit(env_analysis), aes(x = imp_mean, y = individuals)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred") +
+  labs(title = "Raw ant count per species \nvs. Impervious surface cover", 
+       x = "Impervious surface cover (%)", y = "Raw number of ants per species")+
+  theme_bw()
+
+# combine into 1 plot
+(tmp_raw_ant_contpred_plot <- tmp_raw_ant_t2_plot + tmp_raw_ant_moist_plot + 
+    tmp_raw_ant_imp_plot + plot_layout(nrow = 1))  # Arrange in 1 row
+
+# scaled ants vs. ground temperature
+tmp_scaled_ant_t2_plot <- ggplot(na.omit(env_analysis), aes(x = t2_mean, y = scaled_species_total)) + 
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue") +
+  labs(title = "Scaled ant count per species \nvs. Ground temperature", 
+       x = "Ground temperature (\u00B0C)", y = "Scaled number of ants per species")+
+  theme_bw()
+
+# scaled Ants vs. Soil Moisture
+tmp_scaled_ant_moist_plot <- ggplot(na.omit(env_analysis), aes(x = vol_moist_mean, y = scaled_species_total)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(title = "Scaled ant count per species \nvs. Soil moisture", 
+       x = "Volumetric soil moisture (%)", y = "Scaled number of ants per species")+
+  theme_bw()
+
+# scaled Ants vs. Impervious Surface
+tmp_scaled_ant_imp_plot <- ggplot(na.omit(env_analysis), aes(x = imp_mean, y = scaled_species_total)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred") +
+  labs(title = "Scaled ant count per species \nvs. Impervious surface cover", 
+       x = "Impervious surface cover (%)", y = "Scaled number of ants per species")+
+  theme_bw()
+
+# combine into 1 plot
+(tmp_scaled_ant_contpred_plot <- tmp_scaled_ant_t2_plot + tmp_scaled_ant_moist_plot + 
+    tmp_scaled_ant_imp_plot + plot_layout(nrow = 1))  # Arrange in 1 row
+```
+
+```{r 1.2.2.2 visualizing categorical explanatory variables}
+# distribution of cloud cover across exp
+ggplot(na.omit(cut_env_data), aes(x = factor(clouds, levels = c(
+  "no clouds", "lightly cloudy", "very cloudy")))) +
+  geom_bar(fill = "lightblue") +
+  labs(x = "Cloud cover", y = "Number of experiments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  theme_bw()
+
+# distribution of wind across exp
+ggplot(na.omit(cut_env_data), aes(x = factor(wind, levels = c(
+  "no wind", "weak wind", "strong wind")))) +
+  geom_bar(fill = "lightblue") +
+  labs(x = "Wind", y = "Number of experiments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  theme_bw()
+
+# distribution of shade across exp
+ggplot(na.omit(cut_env_data), aes(x = factor(shade, levels = c(
+  "no shade", "half-shade", "full shade")))) +
+  geom_bar(fill = "lightblue") +
+  labs(x = "Shade", y = "Number of experiments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  theme_bw()
+
+# distribution of rain across exp
+ggplot(na.omit(cut_env_data), aes(x = factor(rain))) +
+  geom_bar(fill = "lightblue") +
+  labs(x = "Rain", y = "Number of experiments") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  theme_bw()
+
+# scaled ant count vs clouds
+ggplot(na.omit(env_analysis), aes(x = clouds, y = scaled_species_total)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(x = "Cloud cover", y = "Scaled number of ants per species") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# scaled ant count vs wind
+ggplot(na.omit(env_analysis), aes(x = wind, y = scaled_species_total)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(x = "Wind", y = "Scaled number of ants per species") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# scaled ant count vs shade
+ggplot(na.omit(env_analysis), aes(x = shade, y = scaled_species_total)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(x = "Shade", y = "Scaled number of ants per species") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r 1.2.2.3 visualizing time and day variables}
+# distribution of experiment date
+ggplot(na.omit(env_analysis), aes(x = relative_day)) +
+  geom_histogram(bins = 25, fill = "skyblue", color = "black") +
+  labs(x = "Relative date of experiment", y = "Frequency")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme_bw()
+
+# distribution of experiment start time
+ggplot(na.omit(env_analysis), aes(x = minutes_since_8am)) +
+  geom_histogram(bins = 25, fill = "skyblue", color = "black") +
+  labs(x = "Minutes since 8 AM", y = "Frequency")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme_bw()
+
+# raw Ants vs. relative day
+tmp_raw_ant_day_plot <- ggplot(na.omit(env_analysis), aes(x = relative_day, y = individuals)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred") +
+  labs(title = "Raw ant count per species \nvs. Relative date", 
+       x = "Relative date", y = "Raw number of ants per species")+
+  theme_bw()
+
+# raw Ants vs. time of day
+tmp_raw_ant_time_plot <- ggplot(na.omit(env_analysis), aes(x = minutes_since_8am, y = individuals)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(title = "Raw ant count per species \nvs. Time of day", 
+       x = "Minutes since 8 AM", y = "Raw number of ants per species")+
+  theme_bw()
+
+# combine into 1 plot
+(tmp_raw_ant_timedate_plot <- tmp_raw_ant_day_plot + tmp_raw_ant_time_plot + plot_layout(nrow = 1))  # Arrange in 1 row
+
+# scaled Ants vs. relative day
+tmp_scaled_ant_day_plot <- ggplot(na.omit(env_analysis), aes(x = relative_day, y = individuals)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred") +
+  labs(title = "Scaled ant count per species \nvs. Relative date", 
+       x = "Relative date", y = "Scaled number of ants per species")+
+  theme_bw()
+
+# scaled Ants vs. time of day
+tmp_scaled_ant_time_plot <- ggplot(na.omit(env_analysis), aes(x = minutes_since_8am, y = individuals)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(title = "Scaled ant count per species \nvs. Time of day", 
+       x = "Minutes since 8 AM", y = "Scaled number of ants per species")+
+  theme_bw()
+# combine into 1 plot
+(tmp_scaled_ant_timedate_plot <- tmp_scaled_ant_day_plot + tmp_scaled_ant_time_plot + 
+    plot_layout(nrow = 1))  # Arrange in 1 row
+```
+
+It is apparent that since my data contains a very high amount of zero values, the plots of the raw and scaled ant counts are not very informative in terms of trends in the data.
+
+##### 1.2.3 Visualizing random effects
+
+I plot the distribution of the amount of ants found per site.
+
+```{r 1.2.3.1 random effects visualization}
+# create df for plots
+tmp_site_ind <- left_join(cut_env_data, sp_totals, by = "sample_ID")
+tmp_site_counts <- cut_env_data %>%
+  count(site) %>%  # Count experiments per site
+  left_join(select(cut_env_data, site, city), by = "site") %>% 
+  distinct(site, .keep_all = TRUE)  # Keep only one row per site
+
+# distribution of sites
+ggplot(na.omit(tmp_site_counts), aes(x = factor(site, levels = unique(env_analysis$site)), y = n, fill = city)) +
+  geom_bar(stat = "identity") +  
+  scale_fill_paletteer_d("nationalparkcolors::Acadia") +  # Apply Acadia discrete color scale
+  coord_flip() +  # Flips the axes for better readability
+  labs(title = "Number of Experiments per Site",
+       x = "Site", y = "Number of Experiments") +
+  theme_classic2() +
+  theme(legend.text = element_text(size = 10),  # set legend text
+        legend.title = element_text(size = 12, hjust = 0.5, vjust = 2),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        axis.title.x = element_text(margin = margin(r = 10), size = 12), # adjust distance from axis title to axis, set text size
+        axis.title.y = element_text(margin = margin(r = 10), size = 12)) # adjust distance from axis title to axis, center title
+
+# number of ants per site
+(tmp_ind_site_plot <- ggplot(na.omit(tmp_site_ind), aes(x=site, y=total_ants_sp, fill = site))+  
+    geom_col()+ 
+    scale_fill_viridis_d()+
+    labs(y = "Raw number of ants") +
+    theme_classic()+
+    theme(axis.text.x = element_text(angle = 45, hjust=1, size = 8),
+          legend.position = "none",
+          axis.title.x = element_blank(),  # adjust distance from axis title to axis
+          axis.title.y = element_text(margin = margin(r = 10), hjust = 0.5)) # adjust distance from axis title to axis, center title
+)
+```
+
+```{r 1.2.3.2 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+#### 1.3 Model choice and model assumptions
+
+I am working with count data and multiple explanatory variables (both quantitative and categorical), as well as random effects. Additionally, my scaling process for the response variable at species level has added a lot of structural zeros to my data, since for each experiment there are many species which were not found. Thus, a zero-inflated model is necessary.
+
+I try to fit a zero-inflated binomial (ZIB) GLMM with the number of ants of each species on each experiment representing a "success" and the maximum number of ants for each species across experiments - the number of ants of each species on each experiment as a "failure". I also try to fit a zero-inflated Poisson (ZIP) GLMM with the number of ants of each species on each experiment as the response variable, and the log of the maximum number of ants of each species as an offset.
+
+I first fit a base model with all of the predictor variables described in section 1.1. I fit both a ZIB GLMM and a ZIP GLMM and compare model performance and diagnostic checks to choose the best fitting model.
+
+##### 1.3.1 Model choice and model assumptions
+
+**Zero-Inflated Binomial GLMM**
+
+```{r 1.3.1.1 fitting base ZIB}
+# zero-inflated binomial model
+tmp_model1_zib <- glmmTMB(cbind(individuals, species_max - individuals) ~ 
+                          t2_mean + vol_moist_mean + imp_mean + 
+                          minutes_since_8am + relative_day + 
+                          clouds_numeric + wind_numeric + shade_numeric + 
+                          (1 | site) + (1 | sp_abbr),   # random effects
+                          data = env_analysis,
+                          ziformula = ~ 1,  # Zero-inflation
+                          family = binomial)  # Binomial distribution 
+
+# show anova table, ensure the model has converged without issues
+Anova(tmp_model1_zib, type = "II")
+
+# Check for overdispersion, multicollinearity with performance package
+check_overdispersion(tmp_model1_zib)  # overdispersion
+check_collinearity(tmp_model1_zib)    # multicollinearity
+
+# check models assumptions and residuals with performance package
+check_model(tmp_model1_zib, verbose = T)
+
+# simulate residuals and check model assumptions with DHARMa package
+tmp_sim_model1 <- simulateResiduals(fittedModel = tmp_model1_zib)
+plot(tmp_sim_model1)
+
+# Compute fitted values and Pearson residuals
+tmp_fitted_vals <- fitted(tmp_model1_zib)
+tmp_residuals <- residuals(tmp_model1_zib, type = "pearson")
+# Create binned residuals plot
+arm::binnedplot(tmp_fitted_vals, tmp_residuals)
+```
+
+The ZIB-GLMM shows no pattern in the residuals plot from the `DHARMa` package and the binned plot from the `arm` package shows no clear trend, although the 
+binned residuals plot from the `performance` package seems to show a slight downwards trend. There is no sign of overdispersion or high collinearity.
+
+
+**Zero-Inflated Poisson GLMM**
+
+```{r 1.3.1.2 fitting base ZIP}
+# zero-inflated Poisson model 
+tmp_model1_zip <- glmmTMB(individuals ~ t2_mean + vol_moist_mean + imp_mean + 
+                           minutes_since_8am + relative_day + 
+                           clouds_numeric + wind_numeric + shade_numeric + 
+                           (1 | site) + (1 | sp_abbr),  # random effects
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+# show anova table, ensure model converged without issues
+Anova(tmp_model1_zip, type = "II")
+
+# Check for overdispersion, multicollinearity with performance package
+check_overdispersion(tmp_model1_zip)  # overdispersion
+check_collinearity(tmp_model1_zip)    # multicollinearity
+
+# check models assumptions and residuals with performance package
+check_model(tmp_model1_zip, verbose = T)
+
+# Compute fitted values and Pearson residuals
+tmp_fitted_vals <- fitted(tmp_model1_zip)
+tmp_residuals <- residuals(tmp_model1_zip, type = "pearson")
+# Create binned residuals plot
+arm::binnedplot(tmp_fitted_vals, tmp_residuals)
+
+# simulate residuals and check model assumptions with DHARMa package
+tmp_sim_model1 <- simulateResiduals(fittedModel = tmp_model1_zip)
+plot(tmp_sim_model1)
+```
+
+The ZIP-GLMM shows no pattern in the residuals plot from the `DHARMa` package and the binned plot from the `arm` package shows no clear trend. The plots and tests from the `performance` package show no sign of overdispersion or high collinearity.
+
+```{r 1.3.1.3 compare base models performance}
+compare_performance(tmp_model1_zib, tmp_model1_zip)
+```
+
+Comparing the model fit of both models shows that the ZIP-GLMM performs much better with a significantly lower AIC, AICc, and BIC. the ZIB-GLMM explains more of the overall variance (both higher conditional R2 and marginal R2), but the ZIB model has an extremely high ICC (0.996), suggesting nearly all of the variance is explained by the random effects. The ZIP model has a lower explanatory power but much lower ICC (0.498), meaning the fixed effects contribute more to the explanation of overall variance. The ZIP model has higher model error (RMSE = 14.683), meaning the predictions are less precise.
+
+Overall, the zero-inflated Poisson GLMM performs better than the zero-inflated binomial GLMM. The rest of the analysis will be conducted with the ZIP-GLMM.
+
+
+**Categorical variables**
+
+Now that I have fit the base model, I can test whether the model performs better with the categorical variables as factors or numerically encoded. I fit a model with the categorical variables as factors instead of numerically encoded variables and compare the performance with the base model.
+
+```{r 1.3.1.4 ZIP with categorical predictors as factors}
+# fit ZIP with categorical predictors as factors
+tmp_model1_cat <- glmmTMB(individuals ~ t2_mean + vol_moist_mean + imp_mean + 
+                           minutes_since_8am + relative_day + 
+                           clouds + wind + shade +     # categorical predictors as factors
+                           (1 | site) + (1 | sp_abbr),  # random effects
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+# show summary table to ensure the model has converged (no warnings)
+Anova(tmp_model1_cat, type = "II")
+summary(tmp_model1_cat)
+
+# Check for overdispersion with performance package
+check_overdispersion(tmp_model1_cat)  
+
+# check models assumptions and residuals with performance package
+check_model(tmp_model1_cat, verbose = T)
+
+# Compute fitted values and Pearson residuals
+tmp_fitted_vals <- fitted(tmp_model1_cat)
+tmp_residuals <- residuals(tmp_model1_cat, type = "pearson")
+# Create binned residuals plot
+arm::binnedplot(tmp_fitted_vals, tmp_residuals)
+
+# simulate residuals and check model assumptions with DHARMa package
+tmp_sim_model1 <- simulateResiduals(fittedModel = tmp_model1_cat)
+plot(tmp_sim_model1)
+
+# compare performance of base model and model with categorical var as factors
+compare_performance(tmp_model1_zip, tmp_model1_cat) # base model does better
+```
+
+
+The ZIP model with the categorical variables as factors shows no pattern in the residuals plot from the `DHARMa` package and the Q-Q plot is well aligned with the 1:1 line. The binned plot from the `arm` package shows no clear trend. The plots and tests from the `performance` package show no sign high collinearity, but a slightly significant underdispersion (p = 0.016). Since the Q-Q plot and residuals plots look fine and the overdispersion test is not highly significant, this should not be a large issue.
+
+Comparing model performance show that the categorical model performs much better in terms of AIC, AICc and BIC than the base model. I continue the analysis with the categorical model.
+
+**Interactions**
+
+It is possible that some interactions are at play, so I try different model configurations with interactions.
+
+ - Interaction between temperature and impervious surface cover: the urban heat island effect is a well-documented process happening in urban areas, so it is possible that the effect of temperature on ant foraging depends on urbanization, characterized here as impervious surface cover.  
+ - Interaction between temperature and date: date of experiment is an indirect way of looking at seasonal variation, and temperature fluctuates seasonally. It is possible that species might respond to temperature differently depending on the time of year, e.g. more active when it is warmer in spring but less active when it is too warm in July to avoid heat stress.  
+ - Interaction between temperature and time of day: similar idea to date, where there are daily variations in temperature. Temperature may influence ant foraging differently throughout the day, e.g. positive influence in the morning as temperature rises but negative influence at the hottest times of the day due to heat stress.  
+ 
+```{r 1.3.1.5 adding interaction terms}
+# model interaction between temperature and impervious surface 
+tmp_model1_int_imp <- glmmTMB(individuals ~ t2_mean * imp_mean + vol_moist_mean + 
+                              minutes_since_8am + relative_day +   
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_imp)
+
+# model interaction between temperature and date 
+tmp_model1_int_date <- glmmTMB(individuals ~ t2_mean * relative_day + vol_moist_mean + 
+                              minutes_since_8am + imp_mean +  
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_date)
+
+# model interaction between temperature and time of day 
+tmp_model1_int_time <- glmmTMB(individuals ~ t2_mean * minutes_since_8am + vol_moist_mean + 
+                              relative_day + imp_mean +   
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_time)
+
+# model all 3 interactions  
+tmp_model1_int_all <- glmmTMB(individuals ~ t2_mean * minutes_since_8am + t2_mean * relative_day +
+                                t2_mean * imp_mean + vol_moist_mean + 
+                                clouds + wind + shade +
+                                (1 | site) + (1 | sp_abbr),
+                              offset = log(species_max),   
+                              ziformula = ~1,      # zero-inflation
+                              family = poisson,   # poisson distribution
+                              data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_all)
+
+# model both imperivous surface and date interactions  
+tmp_model1_int_impday <- glmmTMB(individuals ~ t2_mean * relative_day +
+                                    t2_mean * imp_mean + vol_moist_mean + 
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_impday)
+
+# compare performance of base model and interactions
+compare_performance(tmp_model1_cat, tmp_model1_int_imp, tmp_model1_int_date, tmp_model1_int_time, tmp_model1_int_all, tmp_model1_int_impday) 
+```
+
+Comparing model performance shows that the model including all 3 interaction terms performs significantly better than all other models. However, including interaction terms highly increases multicollinearity and all models show variables with VIFs > 10, which is problematic.
+
+I first try to center all variables included in interaction terms around the variable means and compare the model fits again.
+
+```{r 1.3.1.6 centering variables in interaction terms}
+# centering the variables around the mean (centered var = var - mean(var))
+env_analysis <- env_analysis %>%
+  mutate(
+    cent_t2 = scale(t2_mean, center = TRUE, scale = FALSE),  
+    cent_imp = scale(imp_mean, center = TRUE, scale = FALSE),
+    cent_minutes_since_8am = scale(minutes_since_8am, center = TRUE, scale = FALSE),
+    cent_relative_day = scale(relative_day, center = TRUE, scale = FALSE))
+```
+
+```{r 1.3.1.7 interaction models with centered variables}
+# model interaction between temperature and impervious surface 
+tmp_model1_int_imp_c <- glmmTMB(individuals ~ cent_t2 * cent_imp + vol_moist_mean + 
+                              minutes_since_8am + relative_day +   
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_imp_c)
+
+# model interaction between temperature and date 
+tmp_model1_int_date_c <- glmmTMB(individuals ~ cent_t2 * cent_relative_day + vol_moist_mean + 
+                              minutes_since_8am + imp_mean +  
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_date_c)
+
+# model interaction between temperature and time of day 
+tmp_model1_int_time_c <- glmmTMB(individuals ~ cent_t2 * cent_minutes_since_8am + vol_moist_mean + 
+                              relative_day + imp_mean +   
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_time_c)
+
+# model all 3 interactions  
+tmp_model1_int_all_c <- glmmTMB(individuals ~ cent_t2 * cent_minutes_since_8am + cent_t2 * cent_relative_day +
+                                cent_t2 * cent_imp + vol_moist_mean + 
+                                clouds + wind + shade +
+                                (1 | site) + (1 | sp_abbr),
+                              offset = log(species_max),   
+                              ziformula = ~1,      # zero-inflation
+                              family = poisson,   # poisson distribution
+                              data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_all_c)
+
+# model both significant interactions  
+tmp_model1_int_impday_c <- glmmTMB(individuals ~ cent_t2 * cent_relative_day +
+                                    cent_t2 * cent_imp + vol_moist_mean + 
+                              clouds + wind + shade +
+                              (1 | site) + (1 | sp_abbr),
+                      offset = log(species_max),   
+                      ziformula = ~1,      # zero-inflation
+                      family = poisson,   # poisson distribution
+                      data = na.omit(env_analysis))
+
+check_collinearity(tmp_model1_int_impday_c)
+
+# compare performance of base model and interactions
+compare_performance(tmp_model1_cat, tmp_model1_int_imp_c, tmp_model1_int_date_c, tmp_model1_int_time_c, tmp_model1_int_all_c, tmp_model1_int_impday_c) 
+```
+
+Centering the predictors involved in interactions has fixed the collinearity issues, and all models show predictors with low to moderate correlation. Comparing model performance shows that the model which includes all interaction terms still performs much better than all other models with a much lower AIC, AICc, and BIC. 
+
+I can now check model assumptions for the model which includes all interaction terms.
+
+```{r 1.3.1.8 model assumptions for interaction model}
+# check assumptions for model with all interaction terms and centered predictors
+
+# Check for overdispersion with performance package
+check_overdispersion(tmp_model1_int_all_c)  
+check_collinearity(tmp_model1_int_all_c)
+
+# check models assumptions and residuals with performance package
+check_model(tmp_model1_int_all_c, verbose = T)
+
+# Compute fitted values and Pearson residuals
+tmp_fitted_vals <- fitted(tmp_model1_int_all_c)
+tmp_residuals <- residuals(tmp_model1_int_all_c, type = "pearson")
+# Create binned residuals plot
+arm::binnedplot(tmp_fitted_vals, tmp_residuals)
+
+# simulate residuals and check model assumptions with DHARMa package
+tmp_sim_model1 <- simulateResiduals(fittedModel = tmp_model1_int_all_c)
+plot(tmp_sim_model1)
+```
+
+The model with all interaction terms and centered predictors shows no pattern in the residuals plot from the `DHARMa` package and the Q-Q plot is well aligned with the 1:1 line. The binned plot from the `arm` package shows no clear trend. The plots and tests from the `performance` package show no sign of high collinearity, but a significant underdispersion (p < 0.001). Since the Q-Q plot and residuals plots look normal, this should not be a large issue. As described in the `DHARMa` package vignette, "From a technical side, underdispersion is not as concerning as over dispersion, as it will usually bias p-values to the conservative side".
+
+
+##### 1.3.2 Final model choice
+
+From the different model combinations, it appears that the best performing model is a zero-inflated Poisson GLMM with the number of ants per species as a response offset by the maximum number of ants ever found per species, which models how the different predictors affect the relative species-level ant activity. The model has 3 interaction terms: between ground temperature and impervious surface cover, between ground temperature and relative date, between ground temperature and time of day. All predictors involved in interaction terms are centered around their means.The categorical variables are modeled as factors.
+
+```{r 1.3.2.1 final model for RQ1}
+# fit model with all interaction terms and centered predictors
+model1 <- glmmTMB(individuals ~ cent_t2 * cent_minutes_since_8am + cent_t2 * cent_relative_day +
+                                cent_t2 * cent_imp + vol_moist_mean +  
+                                clouds + wind + shade +
+                                (1 | site) + (1 | sp_abbr),
+                              offset = log(species_max),   
+                              ziformula = ~1,      # zero-inflation
+                              family = poisson,   # poisson distribution
+                              data = na.omit(env_analysis))
+```
+
+```{r 1.3.2.2 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+#### 1.4 Results interpretation and plotting
+
+```{r 1.4.1 show model summary}
+# show model results
+Anova(model1, type = "III")
+summary(model1)
+
+# show model performance
+model_performance(model1)
+
+# Extract fixed effects and compute IRR
+tmp_model1_fixed_effects <- tidy(model1, effects = "fixed") %>%
+  mutate(IRR = exp(estimate)) %>%
+  select(term, estimate, std.error, p.value, IRR)
+
+tmp_model1_fixed_effects
+
+# report model results
+report(model1)
+
+# get average values of all predictors involved in interactions
+mean(na.omit(env_analysis$t2_mean))               # mean ground temperature
+mean(na.omit(env_analysis$imp_mean))              # mean impervious surface cover
+mean(na.omit(env_analysis$minutes_since_8am))     # mean exp start time
+mean(na.omit(env_analysis$relative_day))          # mean exp date
+```
+
+I fitted a zero-inflated Poisson generalized linear mixed model (GLMM) (estimated using ML and nlminb optimizer) to analyze the effects of environmental conditions and urbanization on species-level ant foraging activity. Ant foraging activity was modeled as the species-specific number of ants collected at the end of each experiment, offset by the species' maximum observed number of individuals across experiments. The environmental conditions and urbanization variables included as predictor variables (fixed effects) were ground temperature, soil moisture, mean impervious surface cover in a 100m radius around the experiment, time of day, date of experiment, cloud cover, wind, and shade. Three interaction terms were included to test whether the effect of temperature varied with impervious surface cover, date of experiment, and time of day. All variables included in the interaction terms were centered around their mean values to reduce multicollinearity (formula: ant activity ~ centered temperature * centered time of day +  centered temperature * centered date of experiment + centered temperature * centered impervious surface cover + soil moisture + cloud cover + wind + shade). The model included a random intercept for site and species (formulas: ~ 1|site, ~1|species).
+
+The model's total explanatory power is substantial (conditional R2 = 0.64) and the part related to the fixed effects alone (marginal
+R2) is of 0.20. The variance of the site random effect (variance = 8.016) indicates that there is substantial site-level variation in ant activity. The smaller variance of the species random effect (variance = 1.016) suggests moderate species-level differences in ant activity.
+
+The model fit yielded an AIC of 5352.3 and a BIC of 5467.4, with a log-likelihood of -2658.2 and a deviance of 5316.3. The model included 4428 observations, with random effects for 33 sites and 27 species.
+
+The type III Wald chi-square tests from the analysis of deviance table indicate significant effects of all predictor variables and interaction terms (see ANOVA table, p < 0.05).
+
+Since all variables involved in the interactions are centered around their mean values, the main effect of temperature at average impervious surface cover (43.30%), average experiment start time (241.85 minutes after 8:00 AM or 12:02 PM), and average experiment date (59.64 or June 10) is significantly negative (beta = −0.03, SE = 0.01, z = -2.80, P = 0.005). However, the effect of temperature on ant foraging activity varies significantly depending on impervious surface cover, experiment start time, and experiment date. Specifically, the effect of temperature on ant foraging activity becomes significantly less negative in more urbanized areas (beta = 0.001, SE = 0.0003, z = 3.48, p = 0.0005). The effect of temperature also becomes significantly less negative in experiments done at later dates in the season (beta = 0.005  SE = 0.0004, z = 12.47, p < 2e-16). The effect of temperature becomes significantly more negative when the experiment start is later in the day (beta = -0.0002, SE = 0.00006, z = -2.74, p = 0.006).
+
+At an average ground temperature (24.24 °C), impervious surface cover has a significantly negative impact on ant foraging activity (beta = -0.05, SE = 0.005, z = -10.27, p < 2e-16), and so does date of experiment (i.e., at average temperatures, ant foraging activity decreases later in the season) (beta = -0.03, SE = 0.002, z = -12.90, p < 2e-16). However, at average ground temperatures, ant foraging activity significantly increases as experiments are started later in the day (beta = 0.003, SE = 0.0003, z = 10.35, p < 2e-16).
+
+Soil moisture significantly decreases ant foraging activity (beta = -0.01, SE = 0.004, z = -2.72, p = 0.007). In terms of cloud cover and compared to the reference level "no clouds", lightly cloudy conditions significantly increase ant foraging activity (beta = 1.42, SE = 0.08, z = 17.5, p < 2e-16) while very cloudy conditions decrease ant foraging activity (beta = -0.64, SE = 0.04, z = -15.19, p < 2e-16). Compared to the absence of wind, weak wind does not significantly influence ant foraging activity (beta = -0.02, SE = 0.06, z = -0.33, p = 0.74). However, strong wind has a significant negative impact on and foraging activity (beta = -0.65, SE = 0.04, z = -16.28, p < 2e-16). Compared to fully sunny conditions (no shade), half-shade had a significant positive impact on ant foraging activity (beta = 0.68, SE = 0.05, z = 14.56, p < 2e-16) while full shade had a significant negative impact (beta = -0.45, SE = 0.04, z = -12.20, p < 2e-16).
+
+I can plot the interaction terms to visualize how the effect of temperature on ant activity varies with impervious surface cover, time of day and date of experiment.
+
+```{r 1.4.2 plot interaction t2 and imp}
+# get centered values for 0th, 25th, 50th, 75th, 100th percentiles of both variables
+tmp_centered_imp <- quantile(env_analysis$cent_imp, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = T) # impervious surface
+tmp_centered_t2 <- quantile(env_analysis$cent_t2, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = T)   # temperature
+
+# Get predicted values for temperature at specified quantiles of impervious surface and vice-versa
+tmp_pred_int_t2 <- ggpredict(model1, terms = c("cent_t2", paste0("cent_imp [", paste(tmp_centered_imp, collapse = ", "), "]")))
+tmp_pred_int_imp <- ggpredict(model1, terms = c("cent_imp", paste0("cent_t2 [", paste(tmp_centered_t2, collapse = ", "), "]")))
+
+# Define custom labels for effect of temperature across other interacting factors
+tmp_labels <- c("0th", "25th", "50th", "75th", "100th")
+
+# Compute percentiles and min/max for labels of temperature
+tmp_quantiles <- quantile(env_analysis$t2_mean, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# Define custom labels for effect of date across temp
+tmp_t2_labels <- c(paste0(round(tmp_centered_t2[1], 1)," (", round(tmp_quantiles[1], 1), "°C)"), 
+                   paste0(round(tmp_centered_t2[2], 1)," (", round(tmp_quantiles[2], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[3], 1)," (", round(tmp_quantiles[3], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[4], 1)," (", round(tmp_quantiles[4], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[5], 1)," (", round(tmp_quantiles[5], 1), "°C)"))
+
+# plot effect of temperature on ant activity at different urbanization levels
+(tmp_plot_int_imp <- ggplot(tmp_pred_int_t2, aes(x = x, y = predicted, color = group)) + 
+  geom_line(linewidth = 0.5) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.05, color = NA) +  # adds 95% CI
+  labs(x = "Centered ground temperature (\u00B0C)", y = "Predicted species-level ant foraging activity\n(predicted number of individuals)", 
+       title = "Effect of ground temperature\nacross impervious surface cover",
+       color = "Percentile", fill = "Percentile") +
+  scale_color_viridis_d(labels = tmp_labels, 
+                        guide = guide_legend(title.position = "top", title.hjust = 0.5)) +  # adds custom labels and viridis palette
+  scale_fill_viridis_d(labels = tmp_labels, 
+                       guide = guide_legend(title.position = "top", title.hjust = 0.5)) +   # adds custom labels and viridis palette
+  theme_classic2() +
+  theme(legend.text = element_text(size = 9),  # set legend text
+        legend.title = element_text(size = 9, hjust = 0, vjust = 0),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        plot.title = element_text(hjust = 0.5, size = 9, margin = margin(b = 15)),
+        axis.title.x = element_blank(),  # remove axis title
+        axis.title.y = element_text(margin = margin(r = 10), size = 9)) # adjust distance from axis title to axis
+)
+
+# plot effect of urbanization on ant activity at different temperatures
+(tmp_plot_int_imp_t2 <- ggplot(tmp_pred_int_imp, aes(x = x, y = predicted, color = group)) + 
+  geom_line(linewidth = 0.5) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.05, color = NA) +  # adds 95% CI
+  labs(x = "Centered impervious surface cover\n(%)", y = "Predicted species-level ant foraging activity\n(predicted number of individuals)", 
+       title = "Effect of impervious surface cover\nacross ground temperature",
+       color = "Ground temperature (centered)", fill = "Ground temperature (centered)") +
+  scale_color_viridis_d(labels = tmp_t2_labels, 
+                        guide = guide_legend(title.position = "top", title.hjust = 0.5)) +  # adds viridis palette  
+  scale_fill_viridis_d(labels = tmp_t2_labels, 
+                       guide = guide_legend(title.position = "top", title.hjust = 0.5)) +   # adds viridis palette   
+  theme_classic2() +
+  theme(legend.text = element_text(size = 9),  # set legend text
+        legend.title = element_text(size = 9, hjust = 0, vjust = 0),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        plot.title = element_text(hjust = 0.5, size = 9, margin = margin(b = 15)),
+        axis.title.x = element_text(margin = margin(t = 10), size = 9), # remove axis title
+        axis.title.y = element_text(margin = margin(r = 10), size = 9)) # adjust distance from axis title to axis
+)
+```
+
+
+```{r 1.4.3 plot interaction t2 and time}
+# get centered values for 0th, 25th, 50th, 75th, 100th percentiles of both variables
+tmp_centered_start_times <- quantile(env_analysis$cent_minutes_since_8am, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = T) # time of day
+tmp_centered_t2 <- quantile(env_analysis$cent_t2, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = T)   # temperature
+
+# Get predicted values for temperature at specified quantiles of time of day and vice-versa
+tmp_pred_t2_time <- ggpredict(model1, terms = c("cent_t2", paste0("cent_minutes_since_8am [", paste(tmp_centered_start_times, collapse = ", "), "]")))
+tmp_pred_time_t2 <- ggpredict(model1, terms = c("cent_minutes_since_8am", paste0("cent_t2 [", paste(tmp_centered_t2, collapse = ", "), "]")))
+
+# Define custom labels for effect of temperature across other interacting factors
+tmp_labels <- c("0th", "25th", "50th", "75th", "100th")
+
+# Compute percentiles and min/max for labels of temperature
+tmp_quantiles <- quantile(env_analysis$t2_mean, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# Define custom labels for effect of date across temp
+tmp_t2_labels <- c(paste0(round(tmp_centered_t2[1], 1)," (", round(tmp_quantiles[1], 1), "°C)"), 
+                   paste0(round(tmp_centered_t2[2], 1)," (", round(tmp_quantiles[2], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[3], 1)," (", round(tmp_quantiles[3], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[4], 1)," (", round(tmp_quantiles[4], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[5], 1)," (", round(tmp_quantiles[5], 1), "°C)"))
+
+# Plot effect of temperature on ant activity at different start times
+(tmp_plot_int_time <- ggplot(tmp_pred_t2_time, aes(x = x, y = predicted, color = group)) +
+  geom_line(linewidth = 0.5) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.05, color = NA) +  # adds 95% CI
+  labs(x = "Centered ground temperature (\u00B0C)", y = "Predicted species-level ant foraging activity", 
+       title = "Effect of ground temperature\nacross experiment start time",
+       color = "Percentile", fill = "Percentile") +
+  scale_color_viridis_d(labels = tmp_labels, 
+                        guide = guide_legend(title.position = "top", title.hjust = 0.5)) +  # adds custom labels and viridis palette
+  scale_fill_viridis_d(labels = tmp_labels, 
+                       guide = guide_legend(title.position = "top", title.hjust = 0.5)) +   # adds custom labels and viridis palette
+  theme_classic2() +
+  theme(legend.text = element_text(size = 9),  # set legend text
+        legend.title = element_text(size = 9, hjust = 0, vjust = 0),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        plot.title = element_text(hjust = 0.5, size = 9, margin = margin(b = 15)),
+        axis.title.x = element_text(margin = margin(t = 20), size = 9),  # adjust distance from axis title to axis
+        axis.title.y = element_blank())  # remove axis title
+)
+
+# plot effect of time of day on ant activity at different temperatures
+(tmp_plot_int_time_t2 <- ggplot(tmp_pred_time_t2, aes(x = x, y = predicted, color = group)) + 
+  geom_line(linewidth = 0.5) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.05, color = NA) +  # adds 95% CI
+  labs(x = "Centered experiment start time\n(minutes after 8:00 AM)", 
+       y = "Predicted species-level ant foraging activity\n(predicted number of individuals)", 
+       title = "Effect of experiment start time\nacross ground temperature",
+       color = "Ground temperature (centered)", fill = "Ground temperature (centered)") +
+  scale_color_viridis_d(labels = tmp_t2_labels, 
+                        guide = guide_legend(title.position = "top", title.hjust = 0.5)) +  # adds viridis palette  
+  scale_fill_viridis_d(labels = tmp_t2_labels, 
+                       guide = guide_legend(title.position = "top", title.hjust = 0.5)) +   # adds viridis palette   
+  theme_classic2() +
+  theme(legend.text = element_text(size = 9),  # set legend text
+        legend.title = element_text(size = 9, hjust = 0, vjust = 0),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        plot.title = element_text(hjust = 0.5, size = 9, margin = margin(b = 15)),
+        axis.title.x = element_text(margin = margin(t = 10), size = 9), # remove axis title
+        axis.title.y = element_blank()) # adjust distance from axis title to axis
+)
+```
+
+
+```{r 1.4.4 plot interaction t2 and date}
+# get centered values for 0th, 25th, 50th, 75th, 100th percentiles of both variables
+tmp_centered_dates <- quantile(env_analysis$cent_relative_day, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = T) # date
+tmp_centered_t2 <- quantile(env_analysis$cent_t2, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = T)   # temperature
+
+# Get predicted values for temperature at specified quantiles of experiment date and vice-versa
+tmp_pred_t2_date <- ggpredict(model1, terms = c("cent_t2", paste0("cent_relative_day [", paste(tmp_centered_dates, collapse = ", "), "]")))
+tmp_pred_date_t2 <- ggpredict(model1, terms = c("cent_relative_day", paste0("cent_t2 [", paste(tmp_centered_t2, collapse = ", "), "]")))
+
+# Define custom labels for effect of temperature across other interacting factors
+tmp_labels <- c("0th", "25th", "50th", "75th", "100th")
+
+# Compute percentiles and min/max for labels of temperature
+tmp_quantiles <- quantile(env_analysis$t2_mean, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# Define custom labels for effect of date across temp
+tmp_t2_labels <- c(paste0(round(tmp_centered_t2[1], 1)," (", round(tmp_quantiles[1], 1), "°C)"), 
+                   paste0(round(tmp_centered_t2[2], 1)," (", round(tmp_quantiles[2], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[3], 1)," (", round(tmp_quantiles[3], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[4], 1)," (", round(tmp_quantiles[4], 1), "°C)"),
+                   paste0(round(tmp_centered_t2[5], 1)," (", round(tmp_quantiles[5], 1), "°C)"))
+
+# Plot effect of temperature on ant activity at different experiment dates
+(tmp_plot_int_date <- ggplot(tmp_pred_t2_date, aes(x = x, y = predicted, color = group)) +
+  geom_line(linewidth = 0.5) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.05, color = NA) +  # adds 95% CI
+  labs(title = "Effect of ground temperature\nacross date of experiment",
+       color = "Percentile", fill = "Percentile") +
+  scale_color_viridis_d(labels = tmp_labels, 
+                        guide = guide_legend(title.position = "top", title.hjust = 0.5)) +  # adds custom labels and viridis palette
+  scale_fill_viridis_d(labels = tmp_labels, 
+                       guide = guide_legend(title.position = "top", title.hjust = 0.5)) +   # adds custom labels and viridis palette
+  theme_classic2() +
+  theme(legend.text = element_text(size = 9),  # set legend text
+        legend.title = element_text(size = 9, hjust = 0, vjust = 0),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        plot.title = element_text(hjust = 0.5, size = 9, margin = margin(b = 15)),
+        axis.title.x = element_blank(),  # remove axis title
+        axis.title.y = element_blank())  # remove axis title
+)
+
+# plot effect of date on ant activity at different temperatures
+(tmp_plot_int_date_t2 <- ggplot(tmp_pred_date_t2, aes(x = x, y = predicted, color = group)) + 
+  geom_line(linewidth = 0.5) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.05, color = NA) +  # adds 95% CI
+  labs(x = "Centered experiment date\n(relative date)", 
+       title = "Effect of experiment date\nacross ground temperature",
+       color = "Ground temperature (centered)", fill = "Ground temperature (centered)") +
+  scale_color_viridis_d(labels = tmp_t2_labels, 
+                        guide = guide_legend(title.position = "top", title.hjust = 0.5)) +  # adds viridis palette  
+  scale_fill_viridis_d(labels = tmp_t2_labels, 
+                       guide = guide_legend(title.position = "top", title.hjust = 0.5)) +   # adds viridis palette   
+  theme_classic2() +
+  theme(legend.text = element_text(size = 9),  # set legend text
+        legend.title = element_text(size = 9, hjust = 0, vjust = 0),  # Smaller legend title
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        plot.title = element_text(hjust = 0.5, size = 9, margin = margin(b = 15)),
+        axis.title.x = element_text(margin = margin(t = 10), size = 9), # remove axis title
+        axis.title.y = element_blank()) # adjust distance from axis title to axis
+)
+```
+
+```{r 1.4.5 combine interaction plots}
+# combine all interaction plots into 1 plot
+(tmp_interaction_plots <- tmp_plot_int_imp + tmp_plot_int_time + tmp_plot_int_date +  
+    plot_layout(nrow = 1, guides = "collect") + plot_annotation(tag_levels = 'a', tag_suffix = ")") &
+    theme(legend.position = "bottom", legend.box = "vertical"))
+
+# show different percentile values for each predictor
+quantile(env_analysis$imp_mean, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+quantile(env_analysis$minutes_since_8am, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+quantile(env_analysis$relative_day, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# combine all interaction plots across T° in 1 plot
+(tmp_int_t2_plots <- tmp_plot_int_imp_t2 + tmp_plot_int_time_t2 + tmp_plot_int_date_t2 +
+    plot_layout(nrow = 1, guides = "collect") + plot_annotation(tag_levels = 'a', tag_suffix = ")") &
+    theme(legend.position = "bottom", legend.box = "vertical"))
+```
+
+This graph shows predicted species-level ant foraging activity as a function of ground temperature across different levels of impervious surface cover (expressed in % of ground covered by impervious surfaces in a 100m radius around the experiment), time at which the experiment started (expressed in minutes since 8:00 AM), and date of experiment (expressed as a relative date, with the experiment done earliest in the year as day 1). The predictions are based on a zero-inflated Poisson GLMM with the number of ant individuals per species as a response and the maximum observed number of individuals per species included as an offset to account for species-level differences in colony size and foraging strategies. Predicted values reflect the expected number of individuals for an average ant species, shown here with the 95% confidence interval. The predicted values at the 0th, 25th, 50th, 75th, and 100th percentiles of impervious surface cover (0th = 0%, 25th = 27.33%, 50th = 48.20%, 75th = 62.72%, 100th = 93.84%), experiment start time (0th = 10 min or 8:10 AM, 25th = 106 min or 9:46 AM, 50th = 197 min or 11:17 AM, 75th = 318 min or 1:18 PM, 100th = 636 min or 6:36 PM) and experiment date (0th = day 1 or April 12, 25th = day 39 or May 20, 50th = day 50 or May 31, 75th = day 75 or June 25, 100th = day 148 or September 6) are shown.
+
+To visualize how each environmental variable affects ant foraging activity and see which variables have the strongest effect, I can plot the effect sizes of the model.
+
+```{r 1.4.6 plot effect sizes}
+# show model IRRs (exp(estimates))
+tmp_model1_fixed_effects <- tidy(model1, effects = "fixed") %>%
+  mutate(IRR = exp(estimate)) %>%
+  select(term, estimate, std.error, p.value, IRR)
+
+tmp_model1_fixed_effects
+
+# plot fixed effects with IRR directly
+(tmp_effect_sizes <- plot_model(model1, type = "est", show.values = TRUE, 
+                                value.offset = 0.3, digits = 4, dot.size = 1, value.size = 3) +
+  geom_hline(yintercept = 1, color = "black", linetype = 3) +   # add dashed vertical line at 1
+  theme_bw() +
+  ggtitle("Effect sizes of predictors on ant foraging activity") +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 9, hjust = 1)) + 
+  scale_x_discrete(labels = c(                                 # rename the predictors
+    "cent_t2" = "Ground temperature (centered)",  
+    "cent_imp" = "Impervious surface cover (centered)",
+    "vol_moist_mean" = "Soil moisture",
+    "cent_relative_day" = "Date of experiment (centered)",
+    "cent_minutes_since_8am" = "Experiment start time (centered)",
+    "clouds1" = "Cloud cover (lightly cloudy)",
+    "clouds2" = "Cloud cover (very cloudy)",
+    "wind1" = "Wind (weak wind)",
+    "wind2" = "Wind (strong wind)",
+    "shade1" = "Shade (half-shade)",
+    "shade2" = "Shade (full shade)",
+    "cent_t2:cent_minutes_since_8am" = "Interaction of temperature and start time",
+    "cent_t2:cent_relative_day" = "Interaction of temperature and date",
+    "cent_t2:cent_imp" = "Interaction of temperature and impervious surface"
+  ))  # Custom labels for the predictors
+)
+# plot random effects
+plot_model(model1, type = "re", vline.color = "black")
+```
+
+```{r 1.4.7 save plots, include = F}
+# save the interaction plot
+ggsave(filename = "../images/results/interaction_plots.png",
+    plot = tmp_interaction_plots,
+    dpi = 600,
+    width = 16.5,
+    height = 9,
+    units = "cm")
+
+
+# save the other interaction plot
+ggsave(filename = "../images/results/interaction_plots_t2.png",
+    plot = tmp_int_t2_plots,
+    dpi = 600,
+    width = 16.5,
+    height = 9,
+    units = "cm")
+
+# save the effect sizes plot
+ggsave(filename = "../images/results/effect_sizes_plot.png",
+    plot = tmp_effect_sizes,
+    dpi = 600,
+    width = 15,
+    height = 10,
+    units = "cm")
+```
+
+```{r 1.4.8 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+### 2. Research Question 2
+
+The overarching research question is: Can ants differentiate between baits of different sugar concentrations, and do they forage more actively on high sugar  concentration baits? 
+
+More specifically, is there a difference in the average number of ants collected on the baits with different sugar concentrations at the end of the baiting experiments ? Is there an increase in the number of ants present on baits with a higher sugar concentration ?
+
+ * *H0*: the average number of ants found at the end of the experiments the same across all sugar concentrations
+ * *H1*: the average number of ants found at the end of the experiments is significantly different between the different concentrations, and significantly increases with increasing sugar concentration.
+ 
+This research question is treated in two parts: first, I test the effect of sugar concentration on ant foraging activity in terms of presence or absence of ants on the different sugar concentrations. Then, when ants are present on the experiments, I test the effect of sugar concentrations on and foraging activity in terms of species-specific abundance of ants on the different sugar concentrations.
+
+ **Description of tested variables**  
+ 
+  * **Two response variables:**  
+      + overall (non species-specific) presence or absence of ants on each bait at the end of each experiment (binary)  
+      + species-specific proportion of ants found on each bait at the end of each experiment (quantitative, rate between 0 and 1)  
+
+  * **Explanatory variables:** the sugar concentration of the sugar-water solutions added to the baits (either discrete quantitative or ordinal categorical)  
+     
+  * **Random effects:**   
+      + Site (nominal categorical)  
+      + Species (nominal categorical)  
+
+#### 2.1 Presence/absence of ants
+
+I start by modelling the effect of sugar concentration on the presence or absence of ants on the baits. The question is: are ants more likely to be present on certain sugar concentrations than others ?
+
+##### 2.1.1 Exploratory data analysis
+
+I calculate the proportion of baits where ants were present and absent, then I can visualize ant presence vs sugar concentration.This is done both for the species-level table (sugar_analysis) and the overall table (sugar_analysis_overall).
+
+I need to model overall presence and absence, not species-level presence because it adds a lot of "artificial/structural" zeros from species which were not observed on an experiment (most experiments only had 1-2 species present, up to 5).
+
+```{r 2.1.1.1 visualizing ant presence}
+# calculate proportion of presence at species-level
+table(sugar_analysis$presence)  
+prop.table(table(sugar_analysis$presence))  # Proportion of 1s and 0s
+
+# calculate overall proportion of presence
+table(sugar_analysis_overall$presence)  
+prop.table(table(sugar_analysis_overall$presence))  # Proportion of 1s and 0s
+
+
+# visualize ant presence vs concentration at species-level
+ggplot(na.omit(sugar_analysis), aes(x = factor(concentration), fill = factor(presence))) +
+  geom_bar(position = "fill", color = "black") +  # add black outline
+  scale_fill_manual(values = c("white", "black"),
+                    labels = c("Absence", "Presence")) + 
+  labs(x = "Sugar concentration (%)", y = "Proportion of baits occupied", fill = "") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),  # Remove major grid
+        panel.grid.minor = element_blank(),    # Remove minor grid
+        axis.title.y = element_text(margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(margin = margin(t = 10)))
+
+
+# visualize ant presence vs concentration overall
+(tmp_raw_presence_plot <- ggplot(na.omit(sugar_analysis_overall), aes(x = factor(concentration), fill = factor(presence))) +
+  geom_bar(position = "fill", color = "black", size = 0.2) +  # add black outline
+  scale_fill_manual(values = c("white", "black"),
+                    labels = c("Absence", "Presence")) +  # Apply Acadia discrete color scale
+  labs(x = "Sugar concentration (%)", y = "Observed proportion of baits\noccupied by ants", fill = "") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),  # Remove major grid
+        panel.grid.minor = element_blank(),    # Remove minor grid
+        legend.position = "right",           # set legend position
+        legend.text = element_text(size = 8),  # set legend text
+        legend.key.size = unit(0.4, "cm"),  # Makes the legend squares smaller
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(size = 10, margin = margin(t = 10))))
+```
+
+##### 2.1.2 Model choice and model assumptions
+
+For testing the influence of sugar concentration on ant presence or absence, my response variable is binary (1 = ants are present on a given bait, 0 = no ants were found on the bait). For binary data with random effects (the site variable), I run a logistic GLMM.
+
+The sugar concentration predictor can either be considered as a discrete numerical variable or a ordinal categorical variable. I will fit two models with these two options and check which model performs best.
+
+I am modelling the overall ant presence/absence, NOT the species-level data.
+
+```{r 2.1.2.1 initial model fit}
+# fit model with numerical concentration
+tmp_model3_pres_num <- glmer(presence ~ as.numeric(concentration) + (1 | site),
+                        data = sugar_analysis_overall, family = binomial,
+                        control = glmerControl(optimizer = "bobyqa"))
+
+# show summary table to ensure the model has converged (no warnings)
+summary(tmp_model3_pres_num)
+
+# simulate residuals and check model assumptions with DHARMa package
+tmp_sim_model3_pres_num <- simulateResiduals(fittedModel = tmp_model3_pres_num)
+plot(tmp_sim_model3_pres_num)
+
+
+# fit model with categorical concentration
+tmp_model3_pres_cat <- glmer(presence ~ as.factor(concentration) + (1 | site),
+                        data = sugar_analysis_overall, family = binomial,
+                        control = glmerControl(optimizer = "bobyqa"))
+
+# show summary table to ensure the model has converged (no warnings)
+summary(tmp_model3_pres_cat)
+
+# simulate residuals and check model assumptions with DHARMa package
+tmp_sim_model3_pres_cat <- simulateResiduals(fittedModel = tmp_model3_pres_cat)
+plot(tmp_sim_model3_pres_cat)
+
+compare_performance(tmp_model3_pres_num, tmp_model3_pres_cat)
+```
+
+When comparing model performance and model diagnostics plots, it appears that the model with concentration as a factor performs significantly better, so that is the model I use for the analysis.
+
+```{r 2.1.2.2 check model assumptions}
+# final model
+model3_presence <- glmer(presence ~ as.factor(concentration) + (1 | site),
+                        data = sugar_analysis_overall, family = binomial,
+                        control = glmerControl(optimizer = "bobyqa"))
+
+# Check for overdispersion with performance package
+check_overdispersion(model3_presence)
+
+# check model assumptions and residuals with performance package
+check_model(model3_presence, verbose = T)
+
+# check residuals with DHARMa package
+tmp_model3_pres_sim <- simulateResiduals(fittedModel = model3_presence)
+plot(tmp_model3_pres_sim)
+```
+
+The model shows no signs of overdispersion, the outlier test performed by the DHARMa package is not significant, and the residuals vs predicted values plot as well as the binned residuals plot do not show blatant or strong patterns in the residuals.
+
+
+##### 2.1.3 Results interpretation and visualization
+
+```{r 2.1.3.1 extract model summary}
+# show model results
+Anova(model3_presence, type = "II")
+summary(model3_presence)
+
+# Convert model estimates to Odds Ratios
+tmp_model_or <- tidy(model3_presence, effects = "fixed") %>%
+  mutate(OR = exp(estimate),  # Convert log-odds to ORs
+         OR_low = exp(estimate - 1.96 * std.error),  # Lower CI
+         OR_high = exp(estimate + 1.96 * std.error)) # Upper CI
+print(tmp_model_or)
+
+# report model results
+report(model3_presence)
+```
+
+I fitted a generalized linear mixed model (GLMM) with a binomial distribution and a logit link function (estimated using ML (Laplace Approximation) and BOBYQA optimizer) to analyze the effect of sugar concentration on the presence or absence of foraging ants on baits (formula: presence ~ as.factor(concentration)). The model included site as a random effect (formula: ~ 1|site). The model's total explanatory power is substantial (conditional R2 = 0.45) and the part related to the fixed effects alone (marginal R2) is of 0.11. The variance of the site random effect (variance = 2.015) indicates that there is variability in ant presence across different sites.
+
+Sugar concentration shows a positive and highly significant effect on ant presence (Type II Wald Chi-square test, Chisq(4) = 83.16, p < 2.2e-16), showing that baits with sugar water increase the probability of ants being present on the baits compared to pure water baits. Compared to the reference level (0% sugar), the odds of ant presence increased significantly at all concentrations. More specifically, for each concentration (as obtained by Wald z-tests):   
+
+  - The effect of 5% sugar is statistically significant and positive (beta = 1.36, SE = 0.27, z = 5.04, p = 4.70e-07)    
+  - The effect of 10% sugar is statistically significant and positive (beta = 1.67, SE = 0.27,z = 6.24, p = 4.44e-10)    
+  - The effect of 20% sugar is statistically significant and positive (beta = 1.77, SE = 0.27, z = 6.62 , p = 3.69e-11)   
+  - The effect of 40% sugar is statistically significant and positive (beta = 2.43, SE = 0.27, z = 8.94, p < 2e-16)   
+
+
+I can now run a post-hoc test to test for significant differences between the concentrations.
+
+```{r 2.1.3.2 post-hoc test}
+# compute pairwise comparisons between the concentrations
+tmp_model3_pres_emm <- emmeans(model3_presence, pairwise ~ concentration, adjust = "tukey")
+
+print(tmp_model3_pres_emm)
+```
+
+To test for pairwise differences between the different sugar concentration levels, I conducted a post-hoc analysis using Tukey-adjusted Wald z-tests for pairwise comparisons of estimated marginal means (EMMs) on the logit scale. As described above, all sugar concentrations greater than 0% had a significantly positive effect on ant presence compared to pure water (p < 0.0001). 
+
+However, comparisons between intermediate concentrations revealed that there was no significant difference between 5% sugar and 10% sugar (beta = -0.31, SE =  0.29, z = -1.35, p = 0.66), 5% sugar and 20% sugar (beta = -0.41, SE = 0.23, z = -1.81, p = 0.37), or 10% sugar and 20% sugar (beta = -0.11, SE = 0.22, z = -0.47, p = 0.99). In contrast, the 40% sugar concentration had significantly greater ant presence than all other concentrations: 5% sugar (beta = -1.07, SE = 0.23, z = -4.63, p <.0001), 10% sugar (beta = -0.76. SE = 0.23, z = -3.36, p = 0.007), and 20% sugar (beta = -0.65, SE = 0.23, z = -2.90, P = 0.03), indicating a nonlinear response to sugar concentration.
+
+I can plot the predicted probabilities from the model and the results of the pairwise comparisons:
+
+```{r 2.1.3.3 results visualization}
+# get predicted probabilities (transforme log-odds)
+tmp_emm_preds <- emmeans(model3_presence, ~ concentration, type = "response")
+
+# Convert to a data frame for plotting
+tmp_emm_preds_df <- as.data.frame(tmp_emm_preds)
+
+# get pairwise contrasts
+tmp_posthoc_results <- pairs(tmp_emm_preds, adjust = "tukey")
+
+# convert to compact letter display  (CLD) format
+tmp_cld_results <- multcomp::cld(tmp_emm_preds, Letters = letters)
+
+# Merge with prediction data
+tmp_emm_preds_df$letters <- tmp_cld_results$.group
+
+(tmp_presence_pred_plot <- ggplot(tmp_emm_preds_df, aes(x = as.factor(concentration), y = prob)) +
+  geom_point(size = 2) +   # Points for predicted probabilities
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = 0.1, size = 0.3) +  # 95% CI
+  geom_text(aes(label = letters, y = prob), 
+            nudge_x = 0.2,  # move label horizontally (increase to move it right)
+            size = 4) +  # Set text size  
+  labs(x = "Sugar concentration (%)", y = "Predicted proportion of baits\noccupied by ants") +
+  theme_bw() +
+  theme(axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(size = 10, margin = margin(t = 10))))
+```
+
+```{r 2.1.3.4 combine plots}
+# combine both presence plots into 1 plot
+(tmp_presence_plots <- tmp_raw_presence_plot + tmp_presence_pred_plot +
+    plot_layout(nrow = 1) + plot_annotation(tag_levels = 'a', tag_suffix = ")"))  # Arrange in 1 row, adds a), b), c)
+
+```
+
+```{r 2.1.2.5 save plot, include = F}
+# save the interaction plot
+ggsave(filename = "../images/results/presence_plots.png",
+    plot = tmp_presence_plots,
+    dpi = 600,
+    width = 19,
+    height = 9,
+    units = "cm")
+```
+
+
+```{r 2.1.3.5 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+#### 2.2 Ant abundance
+
+Now that I have tested whether sugar concentration affects the likelihood of ants being present at baits, I can look at the second part of the research question: when ants are present, do more ants recruit to the higher sugar concentrations ?
+
+For this analysis, I will only look at experiments where at least one ant was present. For each experiment, I will only keep the rows for which the species total for that experiment is > 0 (i.e., that species was present on at least 1 bait of the experiment).
+
+```{r 2.2.0.1 adapting data set}
+# remove experiments with no ants
+sugar_analysis_abundance <- sugar_analysis %>%
+  group_by(sample_ID) %>%  # group by experiment
+  dplyr::filter(any(individuals > 0, na.rm = T)) %>%  # keep only exp where at least 1 individual is found
+  ungroup()
+
+# only keep rows of species that were present on the experiment
+sugar_analysis_abundance <- sugar_analysis_abundance %>%
+  filter(species_total_exp > 0)
+```
+
+The data frame now has 5 rows per species found on a given experiment (1 per concentration). I.e., for an experiment with 3 species found on it in total, there will be 1 row per species found per concentration, so 3 * 5 = 15 rows. An experiment were only 1 species was found will have 1 * 5 = 5 rows.
+
+##### 2.2.1 Exploratory data analysis
+
+```{r 2.2.1.1 visualizing ant distributions}
+
+# Histogram of raw counts (individuals)
+ggplot(na.omit(sugar_analysis_abundance), aes(x = individuals)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of ant counts on baits", x = "Species-level ant count per bait", y = "Frequency") +
+  theme_classic2() +
+  theme(axis.title.y = element_text(margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(margin = margin(t = 10)))
+
+# number of individuals of each species vs sugar concentration
+ggplot(na.omit(sugar_analysis_abundance), aes(x = as.factor(concentration), y = individuals)) +
+  geom_boxplot() +
+  labs(x = "Sugar concentration (%)", y = "Species-level number of individuals") +
+  theme_classic2() +
+  theme(axis.title.y = element_text(margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(margin = margin(t = 10)))
+
+# scaled ant activity per species vs concentration
+(tmp_raw_abundance_plot <- ggplot(na.omit(sugar_analysis_abundance), aes(x = as.factor(concentration), y = scaled_species_total)) +
+  geom_boxplot(size = 0.3) +
+  labs(x = "Sugar concentration (%)", y = "Observed species-level\nproportion of individuals") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),  # Remove major grid
+        panel.grid.minor = element_blank(),
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(size = 10, margin = margin(t = 10))))
+
+# for plotting overall (non species-specific) abundance, remove exp with 0 ants from sugar_analysis_overall
+sugar_analysis_overall_abundance <- sugar_analysis_overall %>%
+  group_by(sample_ID) %>%  # group by experiment
+  dplyr::filter(any(individuals > 0, na.rm = T)) %>%  # keep only exp where at least 1 individual is found
+  ungroup()
+
+# number of individuals overall vs sugar concentration
+ggplot(na.omit(sugar_analysis_overall_abundance), aes(x = as.factor(concentration), y = individuals)) +
+  geom_boxplot() +
+  labs(x = "Sugar concentration (%)", y = "Overall number of individuals") +
+  theme_classic2() +
+  theme(axis.title.y = element_text(margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(margin = margin(t = 10)))
+
+# scaled ant activity overall vs concentration
+ggplot(na.omit(sugar_analysis_overall_abundance), aes(x = as.factor(concentration), y = scaled_ant_total)) +
+  geom_boxplot() +
+  labs(x = "Sugar concentration (%)", y = "Overall proportion of individuals") +
+  theme_classic2() +
+  theme(axis.title.y = element_text(margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(margin = margin(t = 10)))
+```
+
+
+##### 2.2.2 Model choice and model assumptions
+
+I want to test the influence of sugar concentration on ant abundance. My response variable is based on count data: I look at the number of ants of one species present on one concentration of one experiment, offset by the total number of ants of that species on that experiment (i.e., the proportion of ants of one species on each bait of one experiment).
+
+Since my response variable is a proportion, I can fit a binomial GLMM with the number of individuals of one species on one bait as a "success", and the number of ants on all other baits (total number of ants of the experiments - number of ants on the bait in question) as a "failure". If the data shows significant overdispersion, I can try to fit a beta-binomial GLMM. 
+
+The sugar concentration predictor can either be considered as a discrete numerical variable or a ordinal categorical variable. I also fit two models with these two options and check which model performs best.
+
+```{r 2.2.2.1 binomial GLMM fit}
+# Binomial GLMM model with numerical concentration
+tmp_model3_ab_num <- glmmTMB(cbind(individuals, species_total_exp - individuals) ~ 
+                          concentration + (1 | site) + (1 | sp_abbr), 
+                          family = binomial(link = "logit"),
+                          data = sugar_analysis_abundance)
+
+# Check for overdispersion with performance package
+check_overdispersion(tmp_model3_ab_num)
+
+# check residuals with DHARMa package
+tmp_model3_ab_sim <- simulateResiduals(fittedModel = tmp_model3_ab_num)
+plot(tmp_model3_ab_sim)
+
+# Binomial GLMM model with categorical concentration
+tmp_model3_ab_cat <- glmmTMB(cbind(individuals, species_total_exp - individuals) ~ 
+                          as.factor(concentration) + (1 | site) + (1 | sp_abbr), 
+                          family = binomial(link = "logit"),
+                          data = sugar_analysis_abundance)
+
+# Check for overdispersion with performance package
+check_overdispersion(tmp_model3_ab_cat)
+
+# check residuals with DHARMa package
+tmp_model3_ab_sim <- simulateResiduals(fittedModel = tmp_model3_ab_cat)
+plot(tmp_model3_ab_sim)
+```
+
+Both the overdispersion test from the `performance` package as well as the plots from the `DHARMa` package show overdisperion (with concentration as a factor or as a continuous variable). A binomial GLMM would thus not fit my data. 
+
+I try to fit a beta-binomial GLMM.
+
+```{r 2.2.2.2 beta-binomial GLMM fit}
+# Beta-binomial GLMM with numerical concentration
+tmp_model3_ab_num <- glmmTMB(cbind(individuals, species_total_exp - individuals) ~ 
+                               concentration + (1 | site) + (1 | sp_abbr), 
+                               family = betabinomial,  # Beta-binomial family
+                               data = sugar_analysis_abundance)
+
+# show summary table to ensure the model has converged (no warnings)
+summary(tmp_model3_ab_num)
+
+# Check for overdispersion with performance package
+check_overdispersion(tmp_model3_ab_num)
+
+# check model assumptions and residuals with performance package
+check_model(tmp_model3_ab_num, verbose = T)
+
+# check residuals with DHARMa package
+tmp_model3_ab_sim <- simulateResiduals(fittedModel = tmp_model3_ab_num)
+plot(tmp_model3_ab_sim)
+
+
+# fit model with categorical concentration
+tmp_model3_ab_cat <- glmmTMB(cbind(individuals, species_total_exp - individuals) ~ 
+                               as.factor(concentration) + (1 | site) + (1 | sp_abbr), 
+                               family = betabinomial,  # Beta-binomial family
+                               data = sugar_analysis_abundance)
+
+# show summary table to ensure the model has converged (no warnings)
+summary(tmp_model3_ab_cat)
+
+# Check for overdispersion with performance package
+check_overdispersion(tmp_model3_ab_cat)
+
+# check model assumptions and residuals with performance package
+check_model(tmp_model3_ab_cat, verbose = T)
+
+# check residuals with DHARMa package
+tmp_model3_ab_sim <- simulateResiduals(fittedModel = tmp_model3_ab_cat)
+plot(tmp_model3_ab_sim)
+
+compare_performance(tmp_model3_ab_num, tmp_model3_ab_cat)
+```
+
+The beta-binomial model shows no signs of overdispersion and the residuals vs predicted values plot does not show blatant or strong patterns in the residuals. A beta-binomial GLMM is an appropriate for my data.
+
+When comparing model performance and model diagnostics plots, it appears that the model with concentration as a factor performs better, so that is the model I use for the analysis.
+
+```{r 2.2.2.3 model assumptions}
+# final model
+model3_abundance <- glmmTMB(cbind(individuals, species_total_exp - individuals) ~ 
+                               as.factor(concentration) + (1 | site) + (1 | sp_abbr), 
+                               family = betabinomial,  # Beta-binomial family
+                               data = sugar_analysis_abundance)
+
+# Check for overdispersion with performance package
+check_overdispersion(model3_abundance)  # overdispersion
+
+# check model assumptions with performance package
+check_model(model3_abundance, verbose = T)
+
+# check residuals with DHARMa package
+tmp_model3_ab_sim <- simulateResiduals(fittedModel = model3_abundance)
+plot(tmp_model3_ab_sim)
+```
+
+The beta-binomial model shows no signs of overdispersion, the outlier test performed by the `DHARMa` package is not significant, and the residuals vs predicted values plot does not show blatant or strong patterns in the residuals. The diagnostics plots from the `performance` package show no clear deviation from model assumptions.
+
+##### 2.2.3 Results interpretation and visualization
+
+```{r 2.2.3.1 extract model summary}
+# show model results
+Anova(model3_abundance, type = "II")
+summary(model3_abundance)
+
+# Convert model estimates to Odds Ratios
+tmp_model_ab_or <- tidy(model3_abundance, effects = "fixed") %>%
+  mutate(OR = exp(estimate),  # Convert log-odds to ORs
+         OR_low = exp(estimate - 1.96 * std.error),  # Lower CI
+         OR_high = exp(estimate + 1.96 * std.error)) # Upper CI
+
+print(tmp_model_ab_or)
+
+# report model results
+report(model3_abundance)
+```
+
+I fitted a generalized linear mixed model (GLMM) with a beta-binomial distribution (estimated using ML and nlminb optimizer) to analyze the effect of sugar concentration on the species-level abundance (modeled as the species-specific proportion of ants on each sugar concentration bait) of foraging ants on baits (formula: cbind(individuals, species_total_exp - individuals) ~ as.factor(concentration)). The model included random intercepts for site (formula: ~ 1|site) as well as species (formula: ~ 1|sp_abbr). The model's explanatory power related to the fixed effects alone (marginal R2) is 0.47. The very small variance of the random effects of site (variance = 3.959e-10) and species (variance = 5.966e-10) indicates that there is little site- or species-level variation in ant abundance once sugar concentration is accounted for.
+
+The model fit yielded an AIC of 3033.5 and a BIC of 3073.3, with a log-likelihood of -1508.7 and a deviance of 3017.5. The dispersion parameter for the beta-binomial family was estimated to be 1.74, suggesting moderate dispersion in the data, which is appropriate for this family of distributions. The model included 1076 observations, with random effects for 32 sites and 27 species.
+
+Sugar concentration shows a positive and highly significant effect on ant presence (Type II Wald Chi-square test, Chisq(4) = 195.72, p < 2.2e-16), showing that baits with sugar water increase the species-level abundance of ants on the baits compared to pure water baits. Compared to the reference level (0% sugar), species-level ant abundance increased significantly at all concentrations. More specifically, for each concentration (as obtained by Wald z-tests):   
+
+  - The effect of 5% sugar is statistically significant and positive (beta = 0.97, SE = 0.22, z = 4.45, p = 8.48e-06)   
+  - The effect of 10% sugar is statistically significant and positive (beta = 1.46, SE = 0.21,z = 6.88, p = 5.84e-12)    
+  - The effect of 20% sugar is statistically significant and positive (beta = 1.93, SE = 0.21, z =  9.14, p < 2e-16)   
+  - The effect of 40% sugar is statistically significant and positive (beta = 2.58, SE = 0.21, z = 12.38, p < 2e-16)   
+
+I can now run a post-hoc test to test for significant differences between the concentrations.
+
+```{r 2.2.3.2 post-hoc test}
+# compute pairwise comparisons between the concentrations
+tmp_model3_ab_emm <- emmeans(model3_abundance, pairwise ~ concentration, adjust = "tukey")
+
+print(tmp_model3_ab_emm)
+```
+
+To test for pairwise differences between the different sugar concentration levels, I conducted a post-hoc analysis using Tukey-adjusted Wald z-tests for pairwise comparisons of estimated marginal means (EMMs) on the logit scale. 
+
+The estimated marginal means for each sugar concentration level are shown below. These results are given on the logit scale.
+
+| Concentration | Emmean | SE    | 95% CI Lower Bound | 95% CI Upper Bound |
+|---------------|--------|-------|--------------------|--------------------|
+| 0%            | -2.897 | 0.182 | -3.250             | -2.540             |
+| 5%            | -1.924 | 0.131 | -2.180             | -1.666             |
+| 10%           | -1.439 | 0.117 | -1.670             | -1.209             |
+| 20%           | -0.966 | 0.110 | -1.180             | -0.750             |
+| 40%           | -0.321 | 0.102 | -0.520             | -0.122             |
+
+The pairwise contrasts for sugar concentration levels (with Tukey adjustment for multiple comparisons) are summarized below.
+
+| Contrast                  | Estimate | SE    | z-ratio | p-value  |
+|---------------------------|----------|-------|---------|----------|
+| concentration 0% - 5%     | -0.973   | 0.219 | -4.453  | 0.0001   |
+| concentration 0% - 10%    | -1.458   | 0.212 | -6.883  | <.0001   |
+| concentration 0% - 20%    | -1.931   | 0.211 | -9.138  | <.0001   |
+| concentration 0% - 40%    | -2.576   | 0.208 | -12.381 | <.0001   |
+| concentration 5% - 10%    | -0.485   | 0.171 | -2.841  | 0.0363   |
+| concentration 5% - 20%    | -0.957   | 0.170 | -5.644  | <.0001   |
+| concentration 5% - 40%    | -1.602   | 0.165 | -9.686  | <.0001   |
+| concentration 10% - 20%   | -0.472   | 0.159 | -2.967  | 0.0251   |
+| concentration 10% - 40%   | -1.118   | 0.154 | -7.239  | <.0001   |
+| concentration 20% - 40%   | -0.645   | 0.150 | -4.306  | 0.0002   |
+
+As described above, all sugar concentrations greater than 0% had a significantly positive effect on ant abundance compared to pure water (p < 0.0001). Additionally, all concentrations were significantly different from each other (see Table, p < 0.05).
+
+I can plot the predicted probabilities from the model and the results of the pairwise comparisons:
+
+```{r 2.2.3.3 results visualization}
+# get predicted probabilities (transform log-odds)
+tmp_emm_preds <- emmeans(model3_abundance, ~ concentration, type = "response")
+
+# Convert to a data frame for plotting
+tmp_emm_preds_df <- as.data.frame(tmp_emm_preds)
+
+# get pairwise contrasts
+tmp_posthoc_results <- pairs(tmp_emm_preds, adjust = "tukey")
+
+# convert to compact letter display  (CLD) format
+tmp_cld_results <- multcomp::cld(tmp_emm_preds, Letters = letters)
+
+# Merge with prediction data
+tmp_emm_preds_df$letters <- tmp_cld_results$.group
+
+(tmp_pred_abundance_plot <- ggplot(tmp_emm_preds_df, aes(x = as.factor(concentration), y = prob)) +
+  geom_point(size = 2) +   # Points for predicted probabilities
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = 0.1, size = 0.3) +  # 95% CI
+  geom_text(aes(label = letters, y = prob, x = 1:5), 
+            nudge_x = 0.25,  # move label horizontally (increase to move it right)
+            size = 4) +  # Set text size  
+  labs(x = "Sugar concentration (%)", y = "Predicted species-level\nproportion of individuals") +
+  theme_bw() +
+  theme(axis.title.y = element_text(margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(margin = margin(t = 10)))
+)
+```
+
+```{r 2.2.3.4 combine plots}
+# combine both abundance plots into 1 plot
+(tmp_abundance_plots <- tmp_raw_abundance_plot + tmp_pred_abundance_plot +
+    plot_layout(nrow = 1) + plot_annotation(tag_levels = 'a', tag_suffix = ")"))  # Arrange in 1 row, adds a), b), c)
+
+```
+
+```{r 2.2.3.5 save plot, include = F}
+# save the abundance plot
+ggsave(filename = "../images/results/abundance_plots.png",
+    plot = tmp_abundance_plots,
+    dpi = 600,
+    width = 18,
+    height = 9,
+    units = "cm")
+```
+
+```{r 2.2.3.6 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
+
+### 3. Research Question 3
+
+The overarching research question is: if ants can differentiate between baits of different sugar concentrations, how fast does that differentiation happen ? Do they immediately preferentially recruit to higher concentration baits, or does this preference establish over the time of the experiment ?
+
+In other words, does the proportion of ants on the different sugar concentration baits largely stay the same throughout the experiment, or does the proportion of ants on higher concentrations increase during the 2 hours of the experiment ?
+
+ * *H0*: the proportion of ants found on each sugar concentration bait is the same across all counting time points of the experiment
+ * *H1*: the proportion ants found on each sugar concentration significantly changes over the time of the experiment, and the proportion of ants on higher sugar concentration increases with the counting time points.
+
+ **Description of tested variables**  
+ 
+  * **Response variable:**   
+      + Proportion of ants on each bait at each time point of an experiment, see section on scaling of ant totals (quantitative, from 0 to 1).
+
+  * **Explanatory variables:** 
+      + the sugar concentration of the sugar-water solutions added to the baits (ordinal categorical)  
+      + the time points at which ants are counted, which represent time since experiment start (either ordinal categorical or discrete quantitative)
+      + the interaction of sugar concentration ant time since experiment start
+     
+  * **Random effect:**   
+      + Site (nominal categorical) 
+
+#### 3.1 Exploratory data analysis
+
+I can find the number of experiments where no ant showed up at any time point. 210 experiments had at least 1 ant at 1 time point, meaning 239 - 210 = 29 experiments had no ants for the entire duration.
+
+```{r 3.1.1 experiments with no ants}
+#remove experiments with no ants
+tmp_speed_analysis_no_0 <- speed_analysis %>%
+  group_by(sample_ID) %>%  # group by experiment
+  dplyr::filter(any(individuals > 0, na.rm = T)) %>%  # keep only exp where at least 1 individual is found
+  ungroup()
+
+# number of exp with at least 1 ant over the duration of the experiment
+length(unique(tmp_speed_analysis_no_0$sample_ID))
+# numbe rof experiments with no ants at any time
+length(unique(speed_analysis$sample_ID)) - length(unique(tmp_speed_analysis_no_0$sample_ID))
+```
+
+I can also plot the distribution of the number of ant individuals found on one bait at one time point. The histogram shows that the vast majority of baits at one time point had no ants on them.
+
+```{r 3.1.2 visualizing ant distribution}
+# Histogram of ant counts per bait
+ggplot(na.omit(speed_analysis), aes(x = individuals)) + 
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of ant counts on baits at one time point", x = "Number of ants", y = "Frequency")
+
+# Histogram of ant counts per bait, removing exp with 0 ants
+ggplot(na.omit(tmp_speed_analysis_no_0), aes(x = individuals)) + 
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of ant counts on baits at one time point \n(experiments with at least 1 ant present)", x = "Number of ants", y = "Frequency")
+
+# plot ants per experiment across time
+ggplot(na.omit(speed_analysis), aes(x = count_time, y = total_ants_time, group = sample_ID)) + 
+  geom_line(aes(color = sample_ID), alpha = 0.7) + 
+  geom_point() +
+  labs(title = "Total ant counts over time", x = "Time since experiment start (minutes)", y = "Number of ants per experiment")+
+  theme(legend.position = "none")
+
+
+# plot ants per concentration over time
+ggplot(na.omit(tmp_speed_analysis_no_0), aes(x = count_time, y = scaled_ants_time, color = concentration, group = concentration)) +
+  #geom_point() + 
+  geom_smooth(method = "glm", span = 0.9, se = F, size = 1.5)+
+  scale_color_viridis_d() +  
+  scale_x_continuous(breaks = c(5, 10, 20, 40, 80, 120), limits = c(0, 122))+
+  theme_classic()+
+  labs(x = "Time since experiment start (minutes)", y = "Proportion of ants", color = "Sugar concentration")
+```
+
+
+#### 3.2 Model choice and model assumptions
+
+I want to test whether the influence of sugar concentration on ant abundance changes over the time of the experiment. My response variable is based on count data: I look at the number of ants present on one concentration at one counting time point, offset by the total number of ants on that experiment at that time point (i.e., the proportion of ants on each bait of one experiment at each counting time point).
+
+Since my response variable is a proportion, I can fit a binomial GLMM with the number of individuals on one bait at one time as a "success", and the number of ants on all other baits at that time points (total number of ants on the experiment - number of ants on the bait in question) as a "failure". If the data shows significant overdispersion, I can try to fit a beta-binomial GLMM. 
+
+The sugar concentration predictor can either be considered as a discrete numerical variable or a ordinal categorical variable. The time variable can be considered a categorical variable (since the counting time points are not linearly distributed) or as a numerical variable (which can also be log-transformed to have a linearized time variable). I fit several models with these different options and check which model performs best.
+
+
+```{r 3.2.1 binomial GLMM}
+# binomial GLMM with numerical time
+tmp_model4_bin <- glmer(cbind(individuals, total_ants_time - individuals) ~ 
+                        concentration * count_time + (1 | site),
+                        family = binomial, 
+                        data = na.omit(speed_analysis))
+
+# check for overdispersion
+check_overdispersion(tmp_model4_bin)
+
+# check model residuals
+tmp_model4_simres <- simulateResiduals(tmp_model4_bin)
+plot(tmp_model4_simres)
+```
+
+The binomial GLMM shows overdispersion. I will try to fit a beta-binomial GLMM and compare the performance of both models.
+
+```{r 3.2.2 beta binomial GLMM}
+# beta-binomial GLMM
+tmp_model4_betabin <- glmmTMB(cbind(individuals, total_ants_time - individuals) ~ 
+                              concentration * count_time + (1 | site), 
+                              family = betabinomial(link = "logit"), 
+                              data = na.omit(speed_analysis))
+
+# check for overdispersion
+check_overdispersion(tmp_model4_betabin)
+
+# check model residuals with DHARMa package
+tmp_model4_bb_simres <- simulateResiduals(tmp_model4_betabin)
+plot(tmp_model4_bb_simres)
+
+# compare initial model performance with beta-binomial GLMM
+compare_performance(tmp_model4_betabin, tmp_model4_bin)
+```
+
+The beta-binomial model performs significantly better than the binomial GLMM, and will be used for further analysis.
+
+The counting time can be modeled either as a categorical variable, as a numerical variable or as a log-transformed numerical variable. I model all three and compare model performance.
+
+```{r 3.2.3 modifying the time variable format}
+# beta-binomial GLMM with categorical count times
+tmp_model4_betabin_cat <- glmmTMB(cbind(individuals, total_ants_time - individuals) ~ 
+                              concentration * as.factor(count_time) + (1 | site), 
+                              family = betabinomial(link = "logit"), 
+                              data = na.omit(speed_analysis))
+
+# check for overdispersion
+check_overdispersion(tmp_model4_betabin_cat)
+
+# check model residuals with DHARMa package
+tmp_model4_bb_simres <- simulateResiduals(tmp_model4_betabin_cat)
+plot(tmp_model4_bb_simres)
+
+
+# beta-binomial GLMM with log-transformed numerical count times
+tmp_model4_betabin_log <- glmmTMB(cbind(individuals, total_ants_time - individuals) ~ 
+                              concentration * log(count_time) + (1 | site), 
+                              family = betabinomial(link = "logit"), 
+                              data = na.omit(speed_analysis))
+
+# check for overdispersion
+check_overdispersion(tmp_model4_betabin_log)
+
+# check model residuals with DHARMa package
+tmp_model4_bb_simres <- simulateResiduals(tmp_model4_betabin_log)
+plot(tmp_model4_bb_simres)
+
+
+# compare both model performances
+compare_performance(tmp_model4_betabin, tmp_model4_betabin_cat, tmp_model4_betabin_log)
+```
+
+The model with count time as a numerical variable performs much better than the categorical count time model and the log(time) model, so I continue the analysis with time as a numerical variable. 
+
+I also compare models where sugar concentration is modeled as a numerical variable and as a categorical variable.
+
+```{r 3.2.4 modifying the concentration variable format}
+# beta-binomial GLMM with numerical concentration
+tmp_model4_betabin_num <- glmmTMB(cbind(individuals, total_ants_time - individuals) ~ 
+                              as.numeric(as.character(concentration)) * count_time + (1 | site), 
+                              family = betabinomial(link = "logit"), 
+                              data = na.omit(speed_analysis))
+
+# check for overdispersion
+check_overdispersion(tmp_model4_betabin_num)
+
+# check model residuals with DHARMa package
+tmp_model4_bb_simres <- simulateResiduals(tmp_model4_betabin_num)
+plot(tmp_model4_bb_simres)
+
+# compare both model performances
+compare_performance(tmp_model4_betabin, tmp_model4_betabin_num)
+```
+
+The model with concentration as a categorical variable performs much better than the numerical concentration model, so I continue the analysis with concentration as a categorical variable.
+
+```{r 3.2.5 final model and model assumptions}
+# define final model
+model4 <- glmmTMB(cbind(individuals, total_ants_time - individuals) ~ 
+                              concentration * count_time + (1 | site), 
+                              family = betabinomial(link = "logit"), 
+                              data = na.omit(speed_analysis))
+
+# check for overdispersion
+check_overdispersion(model4)
+
+# check model residuals with DHARMa package
+tmp_model4_bb_simres <- simulateResiduals(model4)
+plot(tmp_model4_bb_simres)
+```
+
+The beta-binomial model shows no signs of overdispersion (tested with the `performance` package) and the residuals vs predicted values plot as well as the Q-Q plot from the `DHARMa` package do not show blatant or strong patterns in the residuals. 
+
+
+#### 3.3 Results interpretation and visualization
+
+The model is a beta-binomial GLMM.
+
+```{r 3.3.1 model summary}
+# type III anova table
+options(contrasts = c("contr.sum", "contr.poly"))  # specify sum-to-zero contrasts
+Anova(model4, type = "III")
+
+# show model summary
+summary(model4)
+
+# report main model findings
+report(model4)
+```
+
+I fitted a generalized linear mixed model (GLMM) with a beta-binomial distribution (estimated using ML and nlminb optimizer) to analyze the effect of sugar concentration, time since experiment start and the interaction of time and sugar concentration on the abundance of foraging ants on baits (modeled as the proportion of ants on each sugar concentration bait at each counting time) (formula: cbind(individuals, total_ants_time - individuals) ~ concentration * count_time). The model included a random intercept for site (formula: ~ 1|site). The model's explanatory power related to the fixed effects
+alone (marginal R2) is 0.37. The very small variance of the random effect (variance = 7.902e-10) indicates that there is little site-level variation in ant abundance once sugar concentration and counting time is accounted for.
+
+The model fit yielded an AIC of 9499.1 and a BIC of 9581.2, with a log-likelihood of -4737.6 and a deviance of 9475.1. The dispersion parameter for the beta-binomial family was estimated to be 2.67, which is appropriate for this family of distributions. The model included 6890 observations, with random effects for 39 sites.
+
+The type III Wald chi-square tests from the analysis of deviance table indicate a highly significant effect of sugar concentration (Chisq(4) = 96.891, p < 2.2e-16), time since experiment start (Chisq(1) = 15.609, p = 7.789e-05), and of the interaction of sugar concentration and time since experiment time (Chisq(4) = 32.528, p = 1.492e-06) on ant foraging, suggesting that the proportion of ants on each sugar concentration was not uniform and that it changed over the course of the experiment.
+
+I can now run a post-hoc analysis to look at the specific slope of the proportion of ants on each sugar concentration bait across experiment time, as well as to test whether there are significant differences in the slopes between concentrations. 
+
+I also run a post-hoc analysis to compare the predicted proportion of ants on each sugar concentrations at the first count time since the of the experiment (count_time = 5), i.e. to test whether there are immediate preferences for specific concentrations.
+
+```{r 3.3.2 post-hoc tests}
+# Get estimated slopes (trends) of count_time for each concentration
+tmp_slope_comparisons <- emtrends(model4, pairwise ~ concentration, var = "count_time", adjust = "tukey")
+
+# Display results
+summary(tmp_slope_comparisons, test = T)
+
+
+# Use emmeans to get marginal means for concentrations at count_time = 5
+tmp_emmeans_results <- emmeans(model4, ~ concentration | count_time, at = list(count_time = 5))
+
+# Perform pairwise contrasts between concentrations at count_time = 5
+tmp_contrast_results <- contrast(tmp_emmeans_results, method = "pairwise")
+
+# Display the results
+summary(tmp_contrast_results)
+```
+
+To compare the effect of time since experiment start on ant foraging activity across the different sugar concentrations, I conducted a post-hoc analysis using Tukey-adjusted Wald z-tests for pairwise comparisons of the estimated slopes (trends) of the relationship between time since experiment time and ant foraging activity for each sugar concentration on the logit scale.
+
+The estimated slopes of the relationship between time and ant foraging activity for each sugar concentration level are shown below. These results are given on the logit scale.
+
+| Concentration | Slope (ant activity vs time) | SE      | 95% CI Lower Bound  | 95% CI Upper Bound  |
+|---------------|------------------------------|---------|---------------------|---------------------|
+| 0%            | -0.00768                     | 0.00194 | -0.01149            | -0.00387            |
+| 5%            | -0.00114                     | 0.00149 | -0.00405            | 0.00178             |
+| 10%           | 0.00312                      | 0.00141 | 0.00035             | 0.00588             |
+| 20%           | -0.00060                     | 0.00131 | -0.00316            | 0.00196             |
+| 40%           | 0.00427                      | 0.00122 | 0.00188             | 0.00667             |
+
+The table shows that on baits with 0% sugar, the proportion of ants on the bait decreases across the time of the experiment (slope = -0.00768, 95% CI = [-0.011, -0.004]). On baits with 5% sugar (slope = -0.001, 95% CI = [-0.004, 0.002]) and 20% sugar (slope = -0.0006, 95% CI = [-0.003, 0.002]), the proportion of ants on the baits does not significantly change over the time of the experiment, as shown by slopes very close to 0 and 95% confidence intervals overlapping with 0. Baits with 10% sugar (slope = 0.003, 95% CI = [0.0003, 0.006]) and 40% sugar (slope = 0.004, 95% CI = [0.002, 0.007]) show an increase in the proportion of ants present on the baits over the time of the experiment.
+
+The pairwise contrasts for sugar concentration levels (with Tukey adjustment for multiple comparisons) are summarized below.
+
+| Contrast                 | Estimate   | SE      | z-ratio | p-value    |
+|--------------------------|------------|---------|---------|------------|
+| concentration 0% - 5%    | -0.00655   | 0.00245 | -2.675  | 0.0577 .   |
+| concentration 0% - 10%   | -0.01080   | 0.00240 | -4.496  | 0.0001 *** |
+| concentration 0% - 20%   | -0.00708   | 0.00234 | -3.025  | 0.0210 *   |
+| concentration 0% - 40%   | -0.01196   | 0.00230 | -5.205  | <.0001 *** |
+| concentration 5% - 10%   | -0.00425   | 0.00205 | -2.075  | 0.2311     |
+| concentration 5% - 20%   | -0.00054   | 0.00198 | -0.271  | 0.9988     |
+| concentration 5% - 40%   | -0.00541   | 0.00193 | -2.810  | 0.0398 *   |
+| concentration 10% - 20%  | 0.00372    | 0.00192 | 1.933   | 0.2999     |
+| concentration 10% - 40%  | -0.00116   | 0.00187 | -0.620  | 0.9719     |
+| concentration 20% - 40%  | -0.00488   | 0.00179 | -2.722  | 0.0508 .   |
+
+
+The relationship between time since experiment start and ant activity is only marginally different on 5% baits form 0% baits (see table, p = 0.0577). The slope for 10%, 20%, and 40% baits is significantly different from the slope of 0% baits (see table, p < 0.05). This suggests that ant activity changed at different rates over the course of the experiment on low concentration baits (0%, 5%) than on higher concentration baits (10%, 20%, 40%). There is a significant difference in the slope on 5% baits and 40% baits (see table, p = 0.0398), as well as a marginally significant difference between the slopes on 20% baits and 40% baits (see table, p = 0.0508). However, the differences between 5%, 10%, and 20% are not significant (see table, p > 0.05), suggesting that the trends in the proportion of ants on these baits is similar over the time of the experiment.
+
+
+To test whether there is a significant difference in the predicted proportion of ants at the start of the experiment (0 minutes since experiment start), I conducted a post-hoc analysis using Tukey-adjusted Wald z-tests for pairwise comparisons of the estimated marginal means (EMMs) for each sugar concentration while holding `count_time` constant at 5.
+
+The estimated marginal means for each sugar concentration level at 5 minutes since experiment start are shown below. These results are given on the logit scale.
+
+| Contrast                 | Estimate   | SE     | z-ratio | p-value   |
+|--------------------------|------------|--------|---------|-----------|
+| concentration 0% - 5%    | -0.36073   | 0.178  | -2.029  | 0.2521    |
+| concentration 0% - 10%   | -0.36835   | 0.177  | -2.085  | 0.2266    |
+| concentration 0% - 20%   | -1.15453   | 0.170  | -6.806  | <.0001    |
+| concentration 0% - 40%   | -1.25706   | 0.165  | -7.624  | <.0001    |
+| concentration 5% - 10%   | -0.00762   | 0.163  | -0.047  | 1.0000    |
+| concentration 5% - 20%   | -0.79380   | 0.155  | -5.114  | <.0001    |
+| concentration 5% - 40%   | -0.89633   | 0.150  | -5.966  | <.0001    |
+| concentration 10% - 20%  | -0.78618   | 0.154  | -5.117  | <.0001    |
+| concentration 10% - 40%  | -0.88871   | 0.149  | -5.973  | <.0001    |
+| concentration 20% - 40%  | -0.10253   | 0.140  | -0.733  | 0.9487    |
+
+As can be seen on the table, there is no significant difference in the predicted proportion of ants at the start of the experiment between the baits with 0%, 5%, and 10% sugar (see table, p > 0.05). Similarly, there is no significant difference in the predicted proportion of ants on the 20% and 40% baits at the start of the experiment (see table, p = 0.95). However, there is a highly significant difference in the predicted proportion of ants at the start of the experiment between these two groups of baits (0%, 5%, 10% vs. 20%, 40%) (see table, p < 0.0001). This shows that according to the model's predictions, from the start of the experiment there is a higher proportion of ants on the baits with the highest sugar concentrations (20% sugar and 40% sugar) than on the baits with lower sugar concentrations (0% sugar, 5% sugar, and 10% sugar).
+
+
+I can plot the predicted probabilities from the model:
+
+```{r 3.3.3 plot model predictions}
+# define the counting times over which to generate predictions
+tmp_count_time_seq <- c(5, 10, 20, 40, 80, 120)
+
+# Use emmeans() to predict over this sequence of count_time values, while keeping concentration as a factor
+tmp_emm_time_preds <- emmeans(model4, ~ count_time | concentration, at = list(count_time = tmp_count_time_seq), type = "response")
+
+# Convert the predictions to a dataframe
+tmp_emm_time_df <- as.data.frame(tmp_emm_time_preds)
+
+# Plot using ggplot2
+(tmp_sugar_vs_time_plot <- ggplot(tmp_emm_time_df, aes(x = count_time, y = prob, color = factor(concentration))) + 
+  geom_line() + 
+  geom_point(size = 2) + 
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = 0.2) +  # 95% CI
+  labs(title = "", 
+       x = "Time since experiment start (minutes)", 
+       y = "Predicted proportion of individuals", 
+       color = "Sugar concentration (%)") + 
+  scale_color_viridis_d(guide = guide_legend(title.position = "top", title.hjust = 0.5)) + # center the title
+  scale_x_continuous(breaks = c(5, 10, 20, 40, 80, 120), limits = c(0, 122))+
+  theme_bw() +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),  # Remove major grid
+        panel.grid.minor = element_blank(),
+        axis.title.y = element_text(size = 10, margin = margin(r = 10), hjust = 0.5), # adjust distance from axis title to axis, center title
+        axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+        legend.title = element_text(size = 9, hjust = 0.5),
+        legend.text = element_text(size = 8))
+)
+```
+
+```{r 3.3.4 save plot, include = F}
+# save the plot
+ggsave(filename = "../images/results/sugar_vs_time_plots.png",
+    plot = tmp_sugar_vs_time_plot,
+    dpi = 600,
+    width = 12,
+    height = 14,
+    units = "cm")
+```
+
+
+```{r 3.3.5 removing temporary objects}
+rm(list = ls(pattern = "^tmp_"))
+```
