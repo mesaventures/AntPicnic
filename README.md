@@ -10,9 +10,9 @@ The R folder contains the scripts described in the Supplementary Materials secti
 
 The images folder contains all figures produced during the data analysis process (S4). 
 
-The data folder contains all raw data files used for the data analysis process as well as all the microclimate logger raw data files. It is organized as such:  
+The data folder contains all data files used for the data analysis process as well as all the microclimate logger raw data files. It is organized as such:  
 
-* The folder tables_for_data_analysis contains the data used in S4. Both a .csv file and a .xslx file are provided. From the .xlsx file, only the sheet labeled "all_years" was exported as .csv and loaded into R for te analysis.
+* The folder tables_for_data_analysis contains the data used in script S4. Both a .csv file and a .xslx file are provided. From the .xlsx file, only the sheet labeled "all_years" was exported as .csv and can be loaded into R for the analysis.
 * The folder climate_loggers contains all the raw climate logger data files (in the subfolder called calibrated_data), as well as empty subfolders (cleaned_logger_data and german_time_data) which get used when running the script S3. The file climate_data_exp_days is a file containing all climate logger data from all experiment days, obtained when running script S3. I have already provided it here.
 * The folder location_data_for_logger_extraction contains information necessary to extract the correct logger data such as experimetn start time, and the data files it contains are used in the script S3.
 * The folder env_data_loggers contains the results of the climate logger data extraction process from script S3. Values from the files with the suffix _means contain the mean temperature and soil moisture values for each experiment from a specific year, and those values were added manually to the full_env_data_all_years Excel file from the tables_for_data_analysis folder.
